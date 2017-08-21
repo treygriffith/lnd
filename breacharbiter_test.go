@@ -171,24 +171,21 @@ var (
 
 	breachedOutputs = []breachedOutput{
 		{
-			amt:           btcutil.Amount(1e7),
-			outpoint:      breachOutPoints[0],
-			witnessType:   lnwallet.CommitmentNoDelay,
-			twoStageClaim: true,
+			amt:         btcutil.Amount(1e7),
+			outpoint:    breachOutPoints[0],
+			witnessType: lnwallet.CommitmentNoDelay,
 		},
 
 		{
-			amt:           btcutil.Amount(2e9),
-			outpoint:      breachOutPoints[1],
-			witnessType:   lnwallet.CommitmentRevoke,
-			twoStageClaim: false,
+			amt:         btcutil.Amount(2e9),
+			outpoint:    breachOutPoints[1],
+			witnessType: lnwallet.CommitmentRevoke,
 		},
 
 		{
-			amt:           btcutil.Amount(3e4),
-			outpoint:      breachOutPoints[2],
-			witnessType:   lnwallet.CommitmentDelayOutput,
-			twoStageClaim: false,
+			amt:         btcutil.Amount(3e4),
+			outpoint:    breachOutPoints[2],
+			witnessType: lnwallet.CommitmentDelayOutput,
 		},
 	}
 
@@ -238,7 +235,7 @@ func init() {
 	// channel point.
 	for i := range retributions {
 		retInfo := &retributions[i]
-		retInfo.remoteIdentity = *breachedOutputs[i].signDescriptor.PubKey
+		retInfo.remoteIdentity = breachedOutputs[i].signDesc.PubKey
 		retributionMap[retInfo.chanPoint] = *retInfo
 	}
 }
@@ -318,7 +315,7 @@ func initBreachedOutputs() error {
 				breachKeys[i])
 		}
 		sd.PubKey = pubkey
-		bo.signDescriptor = *sd
+		bo.signDesc = sd
 	}
 
 	return nil
@@ -393,7 +390,6 @@ func copyRetInfo(retInfo *retributionInfo) *retributionInfo {
 		selfOutput:     retInfo.selfOutput,
 		revokedOutput:  retInfo.revokedOutput,
 		htlcOutputs:    make([]*breachedOutput, nHtlcs),
-		doneChan:       retInfo.doneChan,
 	}
 
 	for i, htlco := range retInfo.htlcOutputs {
@@ -774,8 +770,8 @@ restartCheck:
 			foundSet[ret.chanPoint] = struct{}{}
 
 		} else {
-			return fmt.Errorf("unkwown retribution "+
-				"retrieved from db: %v", ret)
+			return fmt.Errorf("unkwown retribution retrieved "+
+				"from db: %v", ret)
 		}
 
 		return nil
