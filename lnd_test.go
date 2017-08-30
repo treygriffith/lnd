@@ -2044,7 +2044,7 @@ func testRevokedCloseRetributionPostBreachConf(
 
 	// With the channel open, we'll create a few invoices for Caro that
 	// Alice will pay to in order to advance the state of the channel.
-	bobPaymentHashes := make([][]byte, numInvoices)
+	carolPaymentHashes := make([][]byte, numInvoices)
 	for i := 0; i < numInvoices; i++ {
 		preimage := bytes.Repeat([]byte{byte(192 - i)}, 32)
 		invoice := &lnrpc.Invoice{
@@ -2057,30 +2057,30 @@ func testRevokedCloseRetributionPostBreachConf(
 			t.Fatalf("unable to add invoice: %v", err)
 		}
 
-		bobPaymentHashes[i] = resp.RHash
+		carolPaymentHashes[i] = resp.RHash
 	}
 
-	// As we'll be querying the state of bob's channels frequently we'll
+	// As we'll be querying the state of carol's channels frequently we'll
 	// create a closure helper function for the purpose.
 	getCarolChanInfo := func() (*lnrpc.ActiveChannel, error) {
 		req := &lnrpc.ListChannelsRequest{}
-		bobChannelInfo, err := carol.ListChannels(ctxb, req)
+		carolChannelInfo, err := carol.ListChannels(ctxb, req)
 		if err != nil {
 			return nil, err
 		}
-		if len(bobChannelInfo.Channels) != 1 {
-			t.Fatalf("bob should only have a single channel, instead he has %v",
-				len(bobChannelInfo.Channels))
+		if len(carolChannelInfo.Channels) != 1 {
+			t.Fatalf("carol should only have a single channel, instead he has %v",
+				len(carolChannelInfo.Channels))
 		}
 
-		return bobChannelInfo.Channels[0], nil
+		return carolChannelInfo.Channels[0], nil
 	}
 
 	// Wait for Alice to receive the channel edge from the funding manager.
 	ctxt, _ = context.WithTimeout(ctxb, timeout)
 	err = net.Alice.WaitForNetworkChannelOpen(ctxt, chanPoint)
 	if err != nil {
-		t.Fatalf("alice didn't see the alice->bob channel before "+
+		t.Fatalf("alice didn't see the alice->carol channel before "+
 			"timeout: %v", err)
 	}
 
@@ -2094,7 +2094,7 @@ func testRevokedCloseRetributionPostBreachConf(
 	sendPayments := func(start, stop int) error {
 		for i := start; i < stop; i++ {
 			sendReq := &lnrpc.SendRequest{
-				PaymentHash: bobPaymentHashes[i],
+				PaymentHash: carolPaymentHashes[i],
 				Dest:        carol.PubKey[:],
 				Amt:         paymentAmt,
 			}
@@ -2120,34 +2120,34 @@ func testRevokedCloseRetributionPostBreachConf(
 	// Next query for Carol's channel state, as we sent 3 payments of 10k
 	// satoshis each, Carol should now see his balance as being 30k satoshis.
 	time.Sleep(time.Millisecond * 200)
-	bobChan, err := getCarolChanInfo()
+	carolChan, err := getCarolChanInfo()
 	if err != nil {
-		t.Fatalf("unable to get bob's channel info: %v", err)
+		t.Fatalf("unable to get carol's channel info: %v", err)
 	}
-	if bobChan.LocalBalance != 30000 {
-		t.Fatalf("bob's balance is incorrect, got %v, expected %v",
-			bobChan.LocalBalance, 30000)
+	if carolChan.LocalBalance != 30000 {
+		t.Fatalf("carol's balance is incorrect, got %v, expected %v",
+			carolChan.LocalBalance, 30000)
 	}
 
 	// Grab Carol's current commitment height (update number), we'll later
 	// revert him to this state after additional updates to force him to
 	// broadcast this soon to be revoked state.
-	bobStateNumPreCopy := bobChan.NumUpdates
+	carolStateNumPreCopy := carolChan.NumUpdates
 
 	// Create a temporary file to house Carol's database state at this
 	// particular point in history.
-	bobTempDbPath, err := ioutil.TempDir("", "bob-past-state")
+	carolTempDbPath, err := ioutil.TempDir("", "carol-past-state")
 	if err != nil {
 		t.Fatalf("unable to create temp db folder: %v", err)
 	}
-	bobTempDbFile := filepath.Join(bobTempDbPath, "channel.db")
-	defer os.Remove(bobTempDbPath)
+	carolTempDbFile := filepath.Join(carolTempDbPath, "channel.db")
+	defer os.Remove(carolTempDbPath)
 
 	// With the temporary file created, copy Carol's current state into the
 	// temporary file we created above. Later after more updates, we'll
 	// restore this state.
-	bobDbPath := filepath.Join(carol.cfg.DataDir, "simnet/bitcoin/channel.db")
-	if err := copyFile(bobTempDbFile, bobDbPath); err != nil {
+	carolDbPath := filepath.Join(carol.cfg.DataDir, "simnet/bitcoin/channel.db")
+	if err := copyFile(carolTempDbFile, carolDbPath); err != nil {
 		t.Fatalf("unable to copy database files: %v", err)
 	}
 
@@ -2157,9 +2157,9 @@ func testRevokedCloseRetributionPostBreachConf(
 		t.Fatalf("unable to send payment: %v", err)
 	}
 
-	bobChan, err = getCarolChanInfo()
+	carolChan, err = getCarolChanInfo()
 	if err != nil {
-		t.Fatalf("unable to get bob chan info: %v", err)
+		t.Fatalf("unable to get carol chan info: %v", err)
 	}
 
 	// Now we shutdown Carol, copying over the his temporary database state
@@ -2167,19 +2167,19 @@ func testRevokedCloseRetributionPostBreachConf(
 	// state. With this, we essentially force Carol to travel back in time
 	// within the channel's history.
 	if err = net.RestartNode(carol, func() error {
-		return os.Rename(bobTempDbFile, bobDbPath)
+		return os.Rename(carolTempDbFile, carolDbPath)
 	}); err != nil {
 		t.Fatalf("unable to restart node: %v", err)
 	}
 
 	// Now query for Carol's channel state, it should show that he's at a
 	// state number in the past, not the *latest* state.
-	bobChan, err = getCarolChanInfo()
+	carolChan, err = getCarolChanInfo()
 	if err != nil {
-		t.Fatalf("unable to get bob chan info: %v", err)
+		t.Fatalf("unable to get carol chan info: %v", err)
 	}
-	if bobChan.NumUpdates != bobStateNumPreCopy {
-		t.Fatalf("db copy failed: %v", bobChan.NumUpdates)
+	if carolChan.NumUpdates != carolStateNumPreCopy {
+		t.Fatalf("db copy failed: %v", carolChan.NumUpdates)
 	}
 
 	// Now force Carol to execute a *force* channel closure by unilaterally
