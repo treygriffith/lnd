@@ -485,8 +485,7 @@ out:
 // the lingering funds within the channel into the daemon's wallet.
 //
 // NOTE: This MUST be run as a goroutine.
-func (b *breachArbiter) exactRetribution(
-	confChan *chainntnfs.ConfirmationEvent,
+func (b *breachArbiter) exactRetribution(confChan *chainntnfs.ConfirmationEvent,
 	breachInfo *retributionInfo) {
 
 	defer b.wg.Done()
@@ -958,25 +957,40 @@ func (b *breachArbiter) createJusticeTx(
 
 	// Assemble the breached outputs into a slice of spendable outputs,
 	// starting with the self and revoked outputs, then adding any htlc
-	// outputs.
-	var breachedOutputs = make([]SpendableOutput, 2+nHtlcs)
-	breachedOutputs[0] = r.selfOutput
-	breachedOutputs[1] = r.revokedOutput
-	for i, htlcOutput := range r.htlcOutputs {
-		breachedOutputs[2+i] = htlcOutput
-	}
-
+	// outputs. We filter the self and revoked outputs if they do not
+	// contain any value to ensure that the sweep transaction is not
+	// rejected. We will simultaneously compute the sweep transactions
+	// weight to ensure that fees are properly estimated.
+	var breachedOutputs = make([]SpendableOutput, nHtlcs, 2+nHtlcs)
 	var txWeight uint64
+
 	// Begin with a base txn weight, e.g. version, nLockTime, etc.
 	txWeight += 4*lnwallet.BaseSweepTxSize + lnwallet.WitnessHeaderSize
 
-	// Add to_local revoke script and tx input.
-	txWeight += 4*lnwallet.InputSize + lnwallet.ToLocalPenaltyWitnessSize
-	// Add to_remote p2wpkh witness and tx input.
-	txWeight += 4*lnwallet.InputSize + lnwallet.P2WKHWitnessSize
-	// Add revoked offered-htlc witnesses and tx inputs.
-	txWeight += uint64(len(r.htlcOutputs)) *
-		(4*lnwallet.InputSize + lnwallet.OfferedHtlcWitnessSize)
+	// If the self output has any value, append the output to our list of
+	// outputs to spend, and the to_local revoke script and tx input to the
+	// weight calculation.
+	if r.selfOutput.Amount() > 0 {
+		breachedOutputs = append(breachedOutputs, r.selfOutput)
+		txWeight += 4*lnwallet.InputSize +
+			lnwallet.ToLocalPenaltyWitnessSize
+	}
+
+	// If the revoked output has any value, append it to the output list,
+	// and factor in the additional p2wkh witness and tx input into the
+	// weight.
+	if r.revokedOutput.Amount() > 0 {
+		breachedOutputs = append(breachedOutputs, r.revokedOutput)
+		txWeight += 4*lnwallet.InputSize + lnwallet.P2WKHWitnessSize
+	}
+
+	// Finally, add all revoked offered-htlc outputs to the list of outputs
+	// to sweep, each of which contributes an offered-htlc witnesse and tx
+	// input.
+	for _, htlcOutput := range r.htlcOutputs {
+		breachedOutputs = append(breachedOutputs, htlcOutput)
+		txWeight += 4*lnwallet.InputSize + lnwallet.OfferedHtlcWitnessSize
+	}
 
 	return b.sweepSpendableOutputsTxn(txWeight, breachedOutputs...)
 }
