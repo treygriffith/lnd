@@ -288,8 +288,17 @@ func newServer(listenAddrs []string, chanDB *channeldb.DB, cc *chainControl,
 		return nil, err
 	}
 
-	s.breachArbiter = newBreachArbiter(cc.wallet, chanDB, cc.chainNotifier,
-		s.htlcSwitch, s.cc.chainIO, s.cc.feeEstimator)
+	s.breachArbiter = newBreachArbiter(&BreachConfig{
+		Signer:         cc.wallet.Cfg.Signer,
+		DB:             chanDB,
+		Wallet:         cc.wallet,
+		Notifier:       cc.chainNotifier,
+		ChainIO:        s.cc.chainIO,
+		Estimator:      s.cc.feeEstimator,
+		HtlcSwitch:     s.htlcSwitch,
+		Store:          newRetributionStore(chanDB),
+		GenSweepScript: newSweepPkScript,
+	})
 
 	// Create the connection manager which will be responsible for
 	// maintaining persistent outbound connections and also accepting new
