@@ -688,7 +688,7 @@ func (b *breachArbiter) breachObserver(contract *lnwallet.LightningChannel,
 						goto close
 					}
 
-					brarLog.Infof("Sweeping %v breached "+
+					brarLog.Infof("Sweeping breached "+
 						"outputs with: %v",
 						spew.Sdump(sweepTx))
 
@@ -822,7 +822,7 @@ type breachedOutput struct {
 	amt         btcutil.Amount
 	outpoint    wire.OutPoint
 	witnessType lnwallet.WitnessType
-	signDesc    *lnwallet.SignDescriptor
+	signDesc    lnwallet.SignDescriptor
 
 	witnessFunc lnwallet.WitnessGenerator
 }
@@ -839,7 +839,7 @@ func newBreachedOutput(outpoint *wire.OutPoint,
 		amt:         btcutil.Amount(amount),
 		outpoint:    *outpoint,
 		witnessType: witnessType,
-		signDesc:    signDescriptor,
+		signDesc:    *signDescriptor,
 	}
 }
 
@@ -868,8 +868,7 @@ func (bo *breachedOutput) BuildWitness(signer lnwallet.Signer,
 	// been initialized for this breached output.
 	if bo.witnessFunc == nil {
 		bo.witnessFunc = bo.witnessType.GenWitnessFunc(
-			signer,
-			bo.signDesc,
+			signer, &bo.signDesc,
 		)
 	}
 
@@ -954,7 +953,7 @@ func newRetributionInfo(chanPoint *wire.OutPoint,
 	for i, breachedHtlc := range breachInfo.HtlcRetributions {
 		htlcOutputs[i] = newBreachedOutput(
 			&breachedHtlc.OutPoint,
-			lnwallet.CommitmentRevoke,
+			lnwallet.HtlcReceiverRevoke,
 			&breachedHtlc.SignDesc,
 		)
 	}
@@ -1366,7 +1365,7 @@ func (bo *breachedOutput) Encode(w io.Writer) error {
 		return err
 	}
 
-	if err := lnwallet.WriteSignDescriptor(w, bo.signDesc); err != nil {
+	if err := lnwallet.WriteSignDescriptor(w, &bo.signDesc); err != nil {
 		return err
 	}
 
@@ -1391,8 +1390,7 @@ func (bo *breachedOutput) Decode(r io.Reader) error {
 		return err
 	}
 
-	bo.signDesc = &lnwallet.SignDescriptor{}
-	if err := lnwallet.ReadSignDescriptor(r, bo.signDesc); err != nil {
+	if err := lnwallet.ReadSignDescriptor(r, &bo.signDesc); err != nil {
 		return err
 	}
 
