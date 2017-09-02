@@ -2024,7 +2024,8 @@ func testRevokedCloseRetributionRemoteHodl(
 
 	// Since this test will result in the counterparty being left in a weird
 	// state, we will  introduce another node into our test network: Carol.
-	carol, err := net.NewNode([]string{"--debughtlc", "--hodlhtlc"})
+	carol, err := net.NewNode([]string{"--debughtlc", "--hodlhtlc",
+		"--debuglevel=trace"})
 	if err != nil {
 		t.Fatalf("unable to create new nodes: %v", err)
 	}
@@ -2040,7 +2041,7 @@ func testRevokedCloseRetributionRemoteHodl(
 	// maxFundingAmount (2^24) satoshis value.
 	ctxt, _ := context.WithTimeout(ctxb, timeout)
 	chanPoint := openChannelAndAssert(ctxt, t, net, net.Alice, carol,
-		chanAmt, 0)
+		chanAmt, 2*paymentAmt)
 
 	// With the channel open, we'll create a few invoices for Carol that
 	// Alice will pay to in order to advance the state of the channel.
@@ -2058,6 +2059,21 @@ func testRevokedCloseRetributionRemoteHodl(
 		}
 
 		carolPaymentHashes[i] = resp.RHash
+	}
+	// As we'll be querying the state of Alice's channels frequently we'll
+	// create a closure helper function for the purpose.
+	getAliceChanInfo := func() (*lnrpc.ActiveChannel, error) {
+		req := &lnrpc.ListChannelsRequest{}
+		aliceChannelInfo, err := net.Alice.ListChannels(ctxb, req)
+		if err != nil {
+			return nil, err
+		}
+		if len(aliceChannelInfo.Channels) != 1 {
+			t.Fatalf("alice should only have a single channel, instead he has %v",
+				len(aliceChannelInfo.Channels))
+		}
+
+		return aliceChannelInfo.Channels[0], nil
 	}
 
 	// As we'll be querying the state of Carol's channels frequently we'll
@@ -2091,7 +2107,7 @@ func testRevokedCloseRetributionRemoteHodl(
 	if err != nil {
 		t.Fatalf("unable to create payment stream for alice: %v", err)
 	}
-	sendPayments := func(start, stop int) error {
+	sendPayments := func(start, stop int, isHodl bool) error {
 		for i := start; i < stop; i++ {
 			sendReq := &lnrpc.SendRequest{
 				PaymentHash: carolPaymentHashes[i],
@@ -2101,13 +2117,29 @@ func testRevokedCloseRetributionRemoteHodl(
 			if err := alicePayStream.Send(sendReq); err != nil {
 				return err
 			}
+
+			// If the remote peer is in hodl mode, we should not
+			// attempt to receive a message, otherwise the test will
+			// block.
+			if isHodl {
+				continue
+			}
+
+			// Otherwise, the peer is not in hodl mode, and we will
+			// expect a response.
+			if resp, err := alicePayStream.Recv(); err != nil {
+				t.Fatalf("payment stream has been closed: %v", err)
+			} else if resp.PaymentError != "" {
+				t.Fatalf("error when attempting recv: %v",
+					resp.PaymentError)
+			}
 		}
 		return nil
 	}
 
 	// Send payments from Alice to Carol using 3 of Carol's payment hashes
 	// generated above.
-	if err := sendPayments(0, numInvoices/2); err != nil {
+	if err := sendPayments(0, numInvoices/2, true); err != nil {
 		t.Fatalf("unable to send payment: %v", err)
 	}
 
@@ -2119,9 +2151,9 @@ func testRevokedCloseRetributionRemoteHodl(
 	if err != nil {
 		t.Fatalf("unable to get carol's channel info: %v", err)
 	}
-	if carolChan.LocalBalance != 0 {
+	if carolChan.LocalBalance != 2*paymentAmt {
 		t.Fatalf("carol's balance is incorrect, got %v, expected %v",
-			carolChan.LocalBalance, 0)
+			carolChan.LocalBalance, 2*paymentAmt)
 	}
 	// Since Carol has not settled, she should only see one update to her
 	// channel, since Alice is the only party to have sent funds.
@@ -2154,7 +2186,8 @@ func testRevokedCloseRetributionRemoteHodl(
 
 	// Finally, send payments from Alice to Carol, consuming Carol's remaining
 	// payment hashes.
-	if err := sendPayments(numInvoices/2, numInvoices); err != nil {
+	time.Sleep(200 * time.Millisecond)
+	if err := sendPayments(numInvoices/2, numInvoices, true); err != nil {
 		t.Fatalf("unable to send payment: %v", err)
 	}
 
@@ -2162,10 +2195,21 @@ func testRevokedCloseRetributionRemoteHodl(
 	// which has the *prior* channel state over her current most up to date
 	// state. With this, we essentially force Carol to travel back in time
 	// within the channel's history.
+	time.Sleep(200 * time.Millisecond)
 	if err = net.RestartNode(carol, func() error {
 		return os.Rename(carolTempDbFile, carolDbPath)
 	}); err != nil {
 		t.Fatalf("unable to restart node: %v", err)
+	}
+
+	time.Sleep(200 * time.Millisecond)
+	aliceChan, err := getAliceChanInfo()
+	if err != nil {
+		t.Fatalf("unable to get alice chan info: %v", err)
+	}
+	if aliceChan.NumUpdates != 2 {
+		t.Fatalf("alice's numupdates is incorrect, got %v, expected %v",
+			aliceChan.NumUpdates, 2)
 	}
 
 	// Now query for Carol's channel state, it should show that she's at a
@@ -2188,11 +2232,20 @@ func testRevokedCloseRetributionRemoteHodl(
 		t.Fatalf("unable to close channel: %v", err)
 	}
 
+	// Query the mempool for Alice's justice transaction, this should be
+	// broadcast as Bob's contract breaching transaction gets confirmed
+	// above.
+	_, err = waitForTxInMempool(net.Miner.Node, 5*time.Second)
+	if err != nil {
+		t.Fatalf("unable to find Alice's justice tx in mempool: %v", err)
+	}
+	time.Sleep(200 * time.Millisecond)
+
 	// Finally, generate a single block, wait for the final close status
 	// update, then ensure that the closing transaction was included in the
 	// block.
 	block := mineBlocks(t, net, 1)[0]
-	time.Sleep(100 * time.Millisecond)
+	time.Sleep(200 * time.Millisecond)
 
 	// Here, Alice receives a confirmation of Carol's breach transaction.  We
 	// restart Alice to ensure that she is persisting her retribution state and
@@ -3453,7 +3506,7 @@ var testsCases = []*testCase{
 		test: testRevokedCloseRetribution,
 	},
 	{
-		name: "revoked uncooperative close retribution post breach conf",
+		name: "revoked uncooperative close retribution remote hodl",
 		test: testRevokedCloseRetributionRemoteHodl,
 	},
 }
