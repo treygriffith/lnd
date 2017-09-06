@@ -1162,7 +1162,7 @@ func newBreachRetribution(chanState *channeldb.OpenChannel, stateNum uint64,
 	// With the commitment outputs located, we'll now generate all the
 	// retribution structs for each of the HTLC transactions active on the
 	// remote commitment transaction.
-	htlcRetributions := make([]HtlcRetribution, len(chanState.Htlcs))
+	htlcRetributions := make([]HtlcRetribution, len(revokedSnapshot.Htlcs))
 	for i, htlc := range revokedSnapshot.Htlcs {
 		var (
 			htlcScript []byte
