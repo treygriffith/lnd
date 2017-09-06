@@ -528,6 +528,24 @@ func receiverHtlcSpendRevoke(signer Signer, signDesc *SignDescriptor,
 	return witnessStack, nil
 }
 
+// ReceiverHtlcSpendRevoke constructs a valid witness allowing the sender of an
+// HTLC within a previously revoked commitment transaction to re-claim the
+// pending funds in the case that the receiver broadcasts this revoked
+// commitment transaction. This method first derives the appropriate revocation
+// key, and requires that the provided SignDescriptor has a local revocation
+// basepoint and commitment secret in the PubKey and DoubleTweak fields,
+// respectively.
+func ReceiverHtlcSpendRevoke(signer Signer, signDesc *SignDescriptor,
+	sweepTx *wire.MsgTx) (wire.TxWitness, error) {
+
+	// Derive the revocation key using the local revocation base point and
+	// commitment point.
+	revokeKey := DeriveRevocationPubkey(signDesc.PubKey,
+		signDesc.DoubleTweak.PubKey())
+
+	return receiverHtlcSpendRevoke(signer, signDesc, revokeKey, sweepTx)
+}
+
 // receiverHtlcSpendTimeout constructs a valid witness allowing the sender of
 // an HTLC to recover the pending funds after an absolute timeout in the
 // scenario that the receiver of the HTLC broadcasts their version of the
