@@ -25,6 +25,10 @@ const (
 	// of a malicious counterparty's who broadcasts a revoked commitment
 	// transaction.
 	CommitmentRevoke WitnessType = 2
+
+	// HtlcReceiverRevoke is a witness that allow us to sweep a breached
+	// HTLC output.
+	HtlcReceiverRevoke WitnessType = 3
 )
 
 // WitnessGenerator represents a function which is able to generate the final
@@ -52,6 +56,8 @@ func (wt WitnessType) GenWitnessFunc(signer Signer,
 			return CommitSpendNoDelay(signer, desc, tx)
 		case CommitmentRevoke:
 			return CommitSpendRevoke(signer, desc, tx)
+		case HtlcReceiverRevoke:
+			return ReceiverHtlcSpendRevoke(signer, desc, tx)
 		default:
 			return nil, fmt.Errorf("unknown witness type: %v", wt)
 		}
