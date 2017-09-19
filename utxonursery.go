@@ -20,6 +20,10 @@ import (
 )
 
 var (
+	// wombBucket stores presigned transactions that must be broadcast
+	// before the HTLC outputs can be incubated.
+	wombBucket = []byte("womb-txns")
+
 	// preschoolBucket stores outputs from commitment transactions that
 	// have been broadcast, but not yet confirmed. This set of outputs is
 	// persisted in case the system is shut down between the time when the
@@ -86,8 +90,9 @@ var (
 type utxoNursery struct {
 	sync.RWMutex
 
-	notifier chainntnfs.ChainNotifier
-	wallet   *lnwallet.LightningWallet
+	notifier  chainntnfs.ChainNotifier
+	wallet    *lnwallet.LightningWallet
+	estimator lnwallet.FeeEstimator
 
 	db *channeldb.DB
 
@@ -102,14 +107,16 @@ type utxoNursery struct {
 // newUtxoNursery creates a new instance of the utxoNursery from a
 // ChainNotifier and LightningWallet instance.
 func newUtxoNursery(db *channeldb.DB, notifier chainntnfs.ChainNotifier,
-	wallet *lnwallet.LightningWallet) *utxoNursery {
+	wallet *lnwallet.LightningWallet,
+	fe lnwallet.FeeEstimator) *utxoNursery {
 
 	return &utxoNursery{
-		notifier: notifier,
-		wallet:   wallet,
-		requests: make(chan *incubationRequest),
-		db:       db,
-		quit:     make(chan struct{}),
+		notifier:  notifier,
+		wallet:    wallet,
+		estimator: fe,
+		requests:  make(chan *incubationRequest),
+		db:        db,
+		quit:      make(chan struct{}),
 	}
 }
 
@@ -181,7 +188,7 @@ func (u *utxoNursery) reloadPreschool(heightHint uint32) error {
 				return err
 			}
 
-			outpoint := psclOutput.outPoint
+			outpoint := psclOutput.OutPoint()
 			sourceTxid := outpoint.Hash
 
 			confChan, err := u.notifier.RegisterConfirmationsNtfn(
@@ -192,7 +199,7 @@ func (u *utxoNursery) reloadPreschool(heightHint uint32) error {
 			}
 
 			utxnLog.Infof("Preschool outpoint %v re-registered for confirmation "+
-				"notification.", psclOutput.outPoint)
+				"notification.", psclOutput.OutPoint())
 			go psclOutput.waitForPromotion(u.db, confChan)
 			return nil
 		})
@@ -250,6 +257,18 @@ func (u *utxoNursery) Stop() error {
 	return nil
 }
 
+// TLockSpendableOutput defines an interface used to construct a sweep
+// transaction that spends a timelocked output.
+type TLockSpendableOutput interface {
+	SpendableOutput
+
+	OriginChanPoint() *wire.OutPoint
+	BlocksToMaturity() uint32
+
+	SetConfHeight(height uint32)
+	ConfHeight() uint32
+}
+
 // kidOutput represents an output that's waiting for a required blockheight
 // before its funds will be available to be moved into the user's wallet.  The
 // struct includes a WitnessGenerator closure which will be used to generate
@@ -257,19 +276,43 @@ func (u *utxoNursery) Stop() error {
 //
 // TODO(roasbeef): rename to immatureOutput?
 type kidOutput struct {
-	originChanPoint wire.OutPoint
+	breachedOutput
 
-	amt      btcutil.Amount
-	outPoint wire.OutPoint
+	originChanPoint wire.OutPoint
 
 	// TODO(roasbeef): using block timeouts everywhere currently, will need
 	// to modify logic later to account for MTP based timeouts.
 	blocksToMaturity uint32
 	confHeight       uint32
+}
 
-	signDescriptor *lnwallet.SignDescriptor
-	witnessType    lnwallet.WitnessType
-	witnessFunc    lnwallet.WitnessGenerator
+func newKidOutput(outpoint, originChanPoint *wire.OutPoint,
+	blocksToMaturity uint32, witnessType lnwallet.WitnessType,
+	signDescriptor *lnwallet.SignDescriptor) *kidOutput {
+
+	return &kidOutput{
+		breachedOutput: makeBreachedOutput(
+			outpoint, witnessType, signDescriptor,
+		),
+		originChanPoint:  *originChanPoint,
+		blocksToMaturity: blocksToMaturity,
+	}
+}
+
+func (k *kidOutput) OriginChanPoint() *wire.OutPoint {
+	return &k.originChanPoint
+}
+
+func (k *kidOutput) BlocksToMaturity() uint32 {
+	return k.blocksToMaturity
+}
+
+func (k *kidOutput) SetConfHeight(height uint32) {
+	k.confHeight = height
+}
+
+func (k *kidOutput) ConfHeight() uint32 {
+	return k.confHeight
 }
 
 // incubationRequest is a request to the utxoNursery to incubate a set of
@@ -289,15 +332,13 @@ func (u *utxoNursery) IncubateOutputs(closeSummary *lnwallet.ForceCloseSummary) 
 	// that case the SignDescriptor would be nil and we would not have that
 	// output to incubate.
 	if closeSummary.SelfOutputSignDesc != nil {
-		outputAmt := btcutil.Amount(closeSummary.SelfOutputSignDesc.Output.Value)
-		selfOutput := &kidOutput{
-			originChanPoint:  closeSummary.ChanPoint,
-			amt:              outputAmt,
-			outPoint:         closeSummary.SelfOutpoint,
-			blocksToMaturity: closeSummary.SelfOutputMaturity,
-			signDescriptor:   closeSummary.SelfOutputSignDesc,
-			witnessType:      lnwallet.CommitmentTimeLock,
-		}
+		selfOutput := newKidOutput(
+			&closeSummary.SelfOutpoint,
+			&closeSummary.ChanPoint,
+			closeSummary.SelfOutputMaturity,
+			lnwallet.CommitmentTimeLock,
+			closeSummary.SelfOutputSignDesc,
+		)
 
 		incReq.outputs = append(incReq.outputs, selfOutput)
 	}
@@ -340,7 +381,7 @@ out:
 					continue
 				}
 
-				sourceTxid := output.outPoint.Hash
+				sourceTxid := output.OutPoint().Hash
 
 				if err := output.enterPreschool(u.db); err != nil {
 					utxnLog.Errorf("unable to add kidOutput to preschool: %v, %v ",
@@ -547,7 +588,7 @@ func (k *kidOutput) enterPreschool(db *channeldb.DB) error {
 		// Once we have the buckets we can insert the raw bytes of the
 		// immature outpoint into the preschool bucket.
 		var outpointBytes bytes.Buffer
-		if err := writeOutpoint(&outpointBytes, &k.outPoint); err != nil {
+		if err := writeOutpoint(&outpointBytes, k.OutPoint()); err != nil {
 			return err
 		}
 		var kidBytes bytes.Buffer
@@ -563,7 +604,7 @@ func (k *kidOutput) enterPreschool(db *channeldb.DB) error {
 		// track all the immature outpoints for a particular channel's
 		// chanPoint.
 		var b bytes.Buffer
-		err = writeOutpoint(&b, &k.originChanPoint)
+		err = writeOutpoint(&b, k.OriginChanPoint())
 		if err != nil {
 			return err
 		}
@@ -573,7 +614,7 @@ func (k *kidOutput) enterPreschool(db *channeldb.DB) error {
 		}
 
 		utxnLog.Infof("Outpoint %v now in preschool, waiting for "+
-			"initial confirmation", k.outPoint)
+			"initial confirmation", k.OutPoint())
 
 		return nil
 	})
@@ -589,12 +630,12 @@ func (k *kidOutput) waitForPromotion(db *channeldb.DB, confChan *chainntnfs.Conf
 	txConfirmation, ok := <-confChan.Confirmed
 	if !ok {
 		utxnLog.Errorf("notification chan "+
-			"closed, can't advance output %v", k.outPoint)
+			"closed, can't advance output %v", k.OutPoint())
 		return
 	}
 
 	utxnLog.Infof("Outpoint %v confirmed in block %v moving to kindergarten",
-		k.outPoint, txConfirmation.BlockHeight)
+		k.OutPoint(), txConfirmation.BlockHeight)
 
 	k.confHeight = txConfirmation.BlockHeight
 
@@ -621,17 +662,17 @@ func (k *kidOutput) waitForPromotion(db *channeldb.DB, confChan *chainntnfs.Conf
 		// along in the maturity pipeline we first delete the entry
 		// from the preschool bucket, as well as the secondary index.
 		var outpointBytes bytes.Buffer
-		if err := writeOutpoint(&outpointBytes, &k.outPoint); err != nil {
+		if err := writeOutpoint(&outpointBytes, k.OutPoint()); err != nil {
 			return err
 		}
 		if err := psclBucket.Delete(outpointBytes.Bytes()); err != nil {
 			utxnLog.Errorf("unable to delete kindergarten output from "+
-				"preschool bucket: %v", k.outPoint)
+				"preschool bucket: %v", k.OutPoint())
 			return err
 		}
 		if err := psclIndex.Delete(originPoint.Bytes()); err != nil {
 			utxnLog.Errorf("unable to delete kindergarten output from "+
-				"preschool index: %v", k.outPoint)
+				"preschool index: %v", k.OutPoint())
 			return err
 		}
 
@@ -684,8 +725,8 @@ func (k *kidOutput) waitForPromotion(db *channeldb.DB, confChan *chainntnfs.Conf
 		}
 
 		utxnLog.Infof("Outpoint %v now in kindergarten, will mature "+
-			"at height %v (delay of %v)", k.outPoint,
-			maturityHeight, k.blocksToMaturity)
+			"at height %v (delay of %v)", k.OutPoint(),
+			maturityHeight, k.BlocksToMaturity())
 		return nil
 	})
 	if err != nil {
@@ -786,7 +827,8 @@ func fetchGraduatingOutputs(db *channeldb.DB, wallet *lnwallet.LightningWallet,
 	// output or not.
 	for _, kgtnOutput := range kgtnOutputs {
 		kgtnOutput.witnessFunc = kgtnOutput.witnessType.GenWitnessFunc(
-			wallet.Cfg.Signer, kgtnOutput.signDescriptor)
+			wallet.Cfg.Signer, &kgtnOutput.signDesc,
+		)
 	}
 
 	utxnLog.Infof("New block: height=%v, sweeping %v mature outputs",
@@ -852,7 +894,7 @@ func createSweepTx(wallet *lnwallet.LightningWallet,
 	})
 	for _, utxo := range matureOutputs {
 		sweepTx.AddTxIn(&wire.TxIn{
-			PreviousOutPoint: utxo.outPoint,
+			PreviousOutPoint: *utxo.OutPoint(),
 			// TODO(roasbeef): assumes pure block delays
 			Sequence: utxo.blocksToMaturity,
 		})
@@ -989,19 +1031,19 @@ func serializeKidOutput(w io.Writer, kid *kidOutput) error {
 		return err
 	}
 
-	if err := writeOutpoint(w, &kid.outPoint); err != nil {
+	if err := writeOutpoint(w, kid.OutPoint()); err != nil {
 		return err
 	}
-	if err := writeOutpoint(w, &kid.originChanPoint); err != nil {
+	if err := writeOutpoint(w, kid.OriginChanPoint()); err != nil {
 		return err
 	}
 
-	byteOrder.PutUint32(scratch[:4], kid.blocksToMaturity)
+	byteOrder.PutUint32(scratch[:4], kid.BlocksToMaturity())
 	if _, err := w.Write(scratch[:4]); err != nil {
 		return err
 	}
 
-	byteOrder.PutUint32(scratch[:4], kid.confHeight)
+	byteOrder.PutUint32(scratch[:4], kid.ConfHeight())
 	if _, err := w.Write(scratch[:4]); err != nil {
 		return err
 	}
@@ -1011,7 +1053,7 @@ func serializeKidOutput(w io.Writer, kid *kidOutput) error {
 		return err
 	}
 
-	return lnwallet.WriteSignDescriptor(w, kid.signDescriptor)
+	return lnwallet.WriteSignDescriptor(w, &kid.signDesc)
 }
 
 // deserializeKidOutput takes a byte array representation of a kidOutput
@@ -1028,7 +1070,7 @@ func deserializeKidOutput(r io.Reader) (*kidOutput, error) {
 	}
 	kid.amt = btcutil.Amount(byteOrder.Uint64(scratch[:]))
 
-	err := readOutpoint(io.LimitReader(r, 40), &kid.outPoint)
+	err := readOutpoint(io.LimitReader(r, 40), &kid.outpoint)
 	if err != nil {
 		return nil, err
 	}
@@ -1053,8 +1095,7 @@ func deserializeKidOutput(r io.Reader) (*kidOutput, error) {
 	}
 	kid.witnessType = lnwallet.WitnessType(byteOrder.Uint16(scratch[:2]))
 
-	kid.signDescriptor = &lnwallet.SignDescriptor{}
-	if err := lnwallet.ReadSignDescriptor(r, kid.signDescriptor); err != nil {
+	if err := lnwallet.ReadSignDescriptor(r, &kid.signDesc); err != nil {
 		return nil, err
 	}
 
