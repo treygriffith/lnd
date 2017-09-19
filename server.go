@@ -120,7 +120,8 @@ func newServer(listenAddrs []string, chanDB *channeldb.DB, cc *chainControl,
 
 		invoices: newInvoiceRegistry(chanDB),
 
-		utxoNursery: newUtxoNursery(chanDB, cc.chainNotifier, cc.wallet),
+		utxoNursery: newUtxoNursery(chanDB, cc.chainNotifier, cc.wallet,
+			cc.feeEstimator),
 
 		identityPriv: privKey,
 		nodeSigner:   newNodeSigner(privKey),
