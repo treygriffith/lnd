@@ -70,6 +70,18 @@ var (
 	// from which it's necessary to catch up.
 	lastGraduatedHeightKey = []byte("lgh")
 
+	// heightIndex maintains a persistent, 2-layer map to the womb or kid
+	// outputs, grouped by channel point, that can be broadcast at a
+	// particular height.
+	// height -> chanPoint1 -> kidOutpoint
+	//                      -> wombOutpoint
+	//        -> chanPoint2 -> kidOutpoint
+	//
+	heightIndex = []byte("utxon-height-index")
+
+	// channelIndex maintains a
+	channelIndex = []byte("utxo-channel-index")
+
 	byteOrder = binary.BigEndian
 )
 
@@ -461,6 +473,35 @@ type contractMaturityReport struct {
 	// maturityHeight is the absolute block height that this output will mature
 	// at.
 	maturityHeight uint32
+}
+
+type NurseryStore interface {
+	AddKidOutput(*kidOutput) error
+	AddWombOutput(*wombOutput) error
+
+	ForEachKid(func(*kidOutput) error) error
+	ForEachWomb(func(*wombOutput) error) error
+	ForHeightKid(func(*kidOutput) error) error
+	ForHeightWomb(func(*wombOutput) error) error
+
+	RemoveKid(*kidOutput) error
+	RemoveWomb(*wombOutput) error
+}
+
+type nurseryStore struct {
+	db *channeldb.DB
+}
+
+func newNurseryStore(db *channeldb.DB) *nurseryStore {
+	return &nurseryStore{
+		db: db,
+	}
+}
+
+func (ns *nurseryStore) AddKidOutput(kid *kidOutput) error {
+	return ns.db.Update(func(tx *bolt.Tx) error {
+
+	})
 }
 
 // NurseryReport attempts to return a nursery report stored for the target
