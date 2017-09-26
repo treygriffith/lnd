@@ -167,29 +167,35 @@ var (
 
 	kidOutputs = []kidOutput{
 		{
+			breachedOutput: breachedOutput{
+				amt:         btcutil.Amount(13e7),
+				outpoint:    outPoints[0],
+				witnessType: lnwallet.CommitmentTimeLock,
+			},
 			originChanPoint:  outPoints[1],
-			amt:              btcutil.Amount(13e7),
-			outPoint:         outPoints[0],
 			blocksToMaturity: uint32(100),
-			witnessType:      lnwallet.CommitmentTimeLock,
 			confHeight:       uint32(1770001),
 		},
 
 		{
+			breachedOutput: breachedOutput{
+				amt:         btcutil.Amount(24e7),
+				outpoint:    outPoints[1],
+				witnessType: lnwallet.CommitmentTimeLock,
+			},
 			originChanPoint:  outPoints[0],
-			amt:              btcutil.Amount(24e7),
-			outPoint:         outPoints[1],
 			blocksToMaturity: uint32(50),
-			witnessType:      lnwallet.CommitmentTimeLock,
 			confHeight:       uint32(22342321),
 		},
 
 		{
+			breachedOutput: breachedOutput{
+				amt:         btcutil.Amount(2e5),
+				outpoint:    outPoints[2],
+				witnessType: lnwallet.CommitmentTimeLock,
+			},
 			originChanPoint:  outPoints[2],
-			amt:              btcutil.Amount(2e5),
-			outPoint:         outPoints[2],
 			blocksToMaturity: uint32(12),
-			witnessType:      lnwallet.CommitmentTimeLock,
 			confHeight:       uint32(34241),
 		},
 	}
@@ -206,7 +212,7 @@ func TestAddSerializedKidsToList(t *testing.T) {
 			t.Fatalf("unable to parse pub key: %v", keys[i])
 		}
 		descriptor.PubKey = pk
-		kid.signDescriptor = descriptor
+		kid.signDesc = *descriptor
 
 		if err := serializeKidOutput(&b, &kidOutputs[i]); err != nil {
 			t.Fatalf("unable to serialize and add kid output to "+
@@ -235,7 +241,7 @@ func TestSerializeKidOutput(t *testing.T) {
 		t.Fatalf("unable to parse pub key: %v", keys[0])
 	}
 	descriptor.PubKey = pk
-	kid.signDescriptor = descriptor
+	kid.signDesc = *descriptor
 
 	var b bytes.Buffer
 
