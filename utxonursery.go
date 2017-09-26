@@ -20,6 +20,12 @@ import (
 )
 
 var (
+	wombPrefix = []byte("wmb-")
+	psclPrefix = []byte("pre-")
+	kndrPrefix = []byte("kin-")
+)
+
+var (
 	// wombBucket stores presigned transactions that must be broadcast
 	// before the HTLC outputs can be incubated.
 	wombBucket = []byte("womb-txns")
@@ -105,6 +111,7 @@ type utxoNursery struct {
 	notifier  chainntnfs.ChainNotifier
 	wallet    *lnwallet.LightningWallet
 	estimator lnwallet.FeeEstimator
+	store     NurseryStore
 
 	db *channeldb.DB
 
@@ -120,12 +127,13 @@ type utxoNursery struct {
 // ChainNotifier and LightningWallet instance.
 func newUtxoNursery(db *channeldb.DB, notifier chainntnfs.ChainNotifier,
 	wallet *lnwallet.LightningWallet,
-	fe lnwallet.FeeEstimator) *utxoNursery {
+	fe lnwallet.FeeEstimator, ns NurseryStore) *utxoNursery {
 
 	return &utxoNursery{
 		notifier:  notifier,
 		wallet:    wallet,
 		estimator: fe,
+		store:     ns,
 		requests:  make(chan *incubationRequest),
 		db:        db,
 		quit:      make(chan struct{}),
@@ -396,8 +404,17 @@ out:
 				sourceTxid := output.OutPoint().Hash
 
 				if err := output.enterPreschool(u.db); err != nil {
-					utxnLog.Errorf("unable to add kidOutput to preschool: %v, %v ",
-						output, err)
+					utxnLog.Errorf("unable to add "+
+						"kidOutput to preschool: "+
+						"%v, %v ", output, err)
+					continue
+				}
+
+				err := u.store.EnterPreschool(output)
+				if err != nil {
+					utxnLog.Errorf("unable to add "+
+						"kidOutput to new preschool: "+
+						"%v, %v", output, err)
 					continue
 				}
 
@@ -413,6 +430,9 @@ out:
 						sourceTxid)
 					continue
 				}
+
+				u.wg.Add(1)
+				go u.waitForPromotion(output, confChan)
 
 				// Launch a dedicated goroutine that will move
 				// the output from the preschool bucket to the
@@ -475,17 +495,21 @@ type contractMaturityReport struct {
 	maturityHeight uint32
 }
 
+// NurseryStore facilitates the persistent data store for the utxo nursery.
 type NurseryStore interface {
-	AddKidOutput(*kidOutput) error
-	AddWombOutput(*wombOutput) error
+	EnterPreschool(*kidOutput) error
+	PromoteKinder(*kidOutput) error
+	FetchGraduatingOutputs(height uint32) ([]kidOutput, error)
+	LastGraduatingHeight() (uint32, error)
+	//AddWombOutput(*wombOutput) error
 
-	ForEachKid(func(*kidOutput) error) error
-	ForEachWomb(func(*wombOutput) error) error
-	ForHeightKid(func(*kidOutput) error) error
-	ForHeightWomb(func(*wombOutput) error) error
+	//ForEachKid(func(*kidOutput) error) error
+	//ForEachWomb(func(*wombOutput) error) error
+	//ForHeightKid(func(*kidOutput) error) error
+	//ForHeightWomb(func(*wombOutput) error) error
 
-	RemoveKid(*kidOutput) error
-	RemoveWomb(*wombOutput) error
+	//RemoveKid(*kidOutput) error
+	//RemoveWomb(*wombOutput) error
 }
 
 type nurseryStore struct {
@@ -498,10 +522,224 @@ func newNurseryStore(db *channeldb.DB) *nurseryStore {
 	}
 }
 
-func (ns *nurseryStore) AddKidOutput(kid *kidOutput) error {
-	return ns.db.Update(func(tx *bolt.Tx) error {
+func (ns *nurseryStore) LastGraduatingHeight() (uint32, error) {
+	var lastGraduatedHeight uint32
+	err := ns.db.View(func(tx *bolt.Tx) error {
+		hghtIndex := tx.Bucket(heightIndex)
+		if hghtIndex == nil {
+			return nil
+		}
 
+		heightBytes := hghtIndex.Get(lastGraduatedHeightKey)
+		if len(heightBytes) != 4 {
+			return nil
+		}
+
+		lastGraduatedHeight = byteOrder.Uint32(heightBytes)
+
+		return nil
 	})
+	return lastGraduatedHeight, err
+}
+
+/*
+func (ns *nurseryStore) ConceiveWomb(womb *wombOutput) error {
+
+}
+*/
+
+func (ns *nurseryStore) EnterPreschool(kid *kidOutput) error {
+	return ns.db.Update(func(tx *bolt.Tx) error {
+		chanIndex, err := tx.CreateBucketIfNotExists(channelIndex)
+		if err != nil {
+			return err
+		}
+
+		var chanBuffer bytes.Buffer
+		err = writeOutpoint(&chanBuffer, kid.OriginChanPoint())
+		if err != nil {
+			return err
+		}
+		chanPointBytes := chanBuffer.Bytes()
+
+		chanBucket, err := chanIndex.CreateBucketIfNotExists(chanPointBytes)
+		if err != nil {
+			return err
+		}
+
+		var outputBuffer bytes.Buffer
+		if _, err := outputBuffer.Write(psclPrefix); err != nil {
+			return err
+		}
+		err = writeOutpoint(&outputBuffer, kid.OutPoint())
+		if err != nil {
+			return err
+		}
+		outputBytes := outputBuffer.Bytes()
+
+		var kidBuffer bytes.Buffer
+		if err := serializeKidOutput(&kidBuffer, kid); err != nil {
+			return err
+		}
+		kidBytes := kidBuffer.Bytes()
+
+		return chanBucket.Put(outputBytes, kidBytes)
+	})
+}
+
+func (ns *nurseryStore) PromoteKinder(kid *kidOutput) error {
+	return ns.db.Update(func(tx *bolt.Tx) error {
+		chanIndex := tx.Bucket(channelIndex)
+		if chanIndex == nil {
+			return errors.New("unable to open contract index")
+		}
+
+		var chanBuffer bytes.Buffer
+		err := writeOutpoint(&chanBuffer, kid.OriginChanPoint())
+		if err != nil {
+			return err
+		}
+		chanPointBytes := chanBuffer.Bytes()
+
+		chanBucket := chanIndex.Bucket(chanPointBytes)
+		if chanBucket == nil {
+			return errors.New("unable to open channel bucket")
+		}
+
+		var prefixOutputBuffer bytes.Buffer
+		if _, err := prefixOutputBuffer.Write(psclPrefix); err != nil {
+			return err
+		}
+		err = writeOutpoint(&prefixOutputBuffer, kid.OutPoint())
+		if err != nil {
+			return err
+		}
+		prefixOutputBytes := prefixOutputBuffer.Bytes()
+
+		if err := chanBucket.Delete(prefixOutputBytes); err != nil {
+			return err
+		}
+
+		copy(prefixOutputBytes, kndrPrefix)
+
+		var kidBuffer bytes.Buffer
+		if err := serializeKidOutput(&kidBuffer, kid); err != nil {
+			return err
+		}
+		kidBytes := kidBuffer.Bytes()
+
+		if err := chanBucket.Put(prefixOutputBytes, kidBytes); err != nil {
+			return err
+		}
+
+		hghtIndex, err := tx.CreateBucketIfNotExists(heightIndex)
+		if err != nil {
+			return err
+		}
+
+		maturityHeight := kid.ConfHeight() + kid.BlocksToMaturity()
+
+		var heightBytes [4]byte
+		byteOrder.PutUint32(heightBytes[:], maturityHeight)
+
+		hghtBucket, err := hghtIndex.CreateBucketIfNotExists(heightBytes[:])
+		if err != nil {
+			return err
+		}
+
+		hghtChanBucket, err := hghtBucket.CreateBucketIfNotExists(chanPointBytes)
+		if err != nil {
+			return err
+		}
+
+		return hghtChanBucket.Put(prefixOutputBytes[4:], kndrPrefix)
+	})
+}
+
+func (ns *nurseryStore) FetchGraduatingOutputs(height uint32) ([]kidOutput, error) {
+	var kids []kidOutput
+	if err := ns.db.View(func(tx *bolt.Tx) error {
+		hghtIndex := tx.Bucket(heightIndex)
+		if hghtIndex == nil {
+			return nil
+		}
+
+		var heightBytes [4]byte
+		byteOrder.PutUint32(heightBytes[:], height)
+
+		hghtBucket := hghtIndex.Bucket(heightBytes[:])
+		if hghtBucket == nil {
+			return nil
+		}
+
+		var channelBuckets [][]byte
+		if err := hghtBucket.ForEach(func(chanBytes, valBytes []byte) error {
+			if valBytes == nil {
+				channelBuckets = append(channelBuckets, chanBytes)
+			}
+
+			return nil
+		}); err != nil {
+			return err
+		}
+
+		chanIndex := tx.Bucket(channelIndex)
+		if chanIndex == nil {
+			return nil
+		}
+
+		for _, chanBytes := range channelBuckets {
+			hghtChanBucket := hghtBucket.Bucket(chanBytes)
+			if hghtChanBucket == nil {
+				continue
+			}
+
+			chanBucket := chanIndex.Bucket(chanBytes)
+			if chanBucket == nil {
+				continue
+			}
+
+			err := hghtChanBucket.ForEach(func(output, prefix []byte) error {
+				if bytes.Compare(prefix, kndrPrefix) != 0 {
+					return nil
+				}
+
+				var keyBuffer bytes.Buffer
+				if _, err := keyBuffer.Write(kndrPrefix); err != nil {
+					return err
+				}
+				if _, err := keyBuffer.Write(output); err != nil {
+					return err
+				}
+				keyBytes := keyBuffer.Bytes()
+
+				kidBytes := chanBucket.Get(keyBytes)
+				if kidBytes == nil {
+					return nil
+				}
+
+				kidReader := bytes.NewBuffer(kidBytes)
+				kid, err := deserializeKidOutput(kidReader)
+				if err != nil {
+					return err
+				}
+
+				kids = append(kids, *kid)
+
+				return nil
+			})
+			if err != nil {
+				return err
+			}
+		}
+
+		return nil
+
+	}); err != nil {
+		return nil, err
+	}
+
+	return kids, nil
 }
 
 // NurseryReport attempts to return a nursery report stored for the target
@@ -661,6 +899,34 @@ func (k *kidOutput) enterPreschool(db *channeldb.DB) error {
 	})
 }
 
+func (u *utxoNursery) waitForPromotion(kid *kidOutput,
+	confChan *chainntnfs.ConfirmationEvent) {
+
+	defer u.wg.Done()
+
+	select {
+	case txConfirmation, ok := <-confChan.Confirmed:
+		if !ok {
+			utxnLog.Errorf("notification chan "+
+				"closed, can't advance output %v",
+				kid.OutPoint())
+			return
+		}
+
+		kid.SetConfHeight(txConfirmation.BlockHeight)
+
+	case <-u.quit:
+		return
+	}
+
+	err := u.store.PromoteKinder(kid)
+	if err != nil {
+		utxnLog.Errorf("unable to move kid output "+
+			"from preschool bucket to "+
+			"kindergarten bucket: %v", err)
+	}
+}
+
 // waitForPromotion is intended to be run as a goroutine that will wait until a
 // channel force close commitment transaction has been included in a confirmed
 // block. Once the transaction has been confirmed (as reported by the Chain
@@ -788,6 +1054,11 @@ func (u *utxoNursery) graduateKindergarten(blockHeight uint32) error {
 	// particular block height. We can graduate an output once we've
 	// reached its height maturity.
 	kgtnOutputs, err := fetchGraduatingOutputs(u.db, u.wallet, blockHeight)
+	if err != nil {
+		return err
+	}
+
+	_, err = u.store.FetchGraduatingOutputs(blockHeight)
 	if err != nil {
 		return err
 	}
