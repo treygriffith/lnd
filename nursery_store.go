@@ -10,6 +10,61 @@ import (
 	"github.com/roasbeef/btcd/wire"
 )
 
+//            NURSERY OUTPUT STATE TRANSITIONS
+//
+//   ┌ ─ ─ ─ ─ ─ ─ ─ ─ ─┐         ┌ ─ ─ ─ ─ ─ ─ ─ ─ ─┐
+//   | EnterPreschool() │         | CallBabysitter() │
+//   └ ─ ─ ─ ─ ─ ─ ─ ─ ─┘         └ ─ ─ ─ ─ ─ ─ ─ ─ ─┘
+//             │                            │
+//             │                            │
+//             ▼                            ▼
+//   ┏━━━━━━━━━━━━━━━━━━┓         ┏━━━━━━━━━━━━━━━━━━┓
+//   ┃ Preschool Bucket ┃         ┃    Baby Bucket   ┃
+//   ┗━━━━━━━━━━━━━━━━━━┛         ┗━━━━━━━━━━━━━━━━━━┛
+//             │                            │
+//             │                            |
+//             |                            ▼
+//             |                           ╱ ╲
+//             |                          ▕   ▏ Wait CLTV + PublishTxn
+//             |                           ╲ ╱
+//             │                            |
+//             │                            │
+//             ▼                            ▼
+//            .─.                          .─.
+//           (   )  waitForPromotion      (   )  waitForEnrollment
+//            `─'                          `─'
+//             │                            │
+//             │                            │
+//             ▼                            ▼
+//   ┌─ ─ ─ ─ ─ ─ ─ ─ ─ ┐         ┌ ─ ─ ─ ─ ─ ─ ─ ─ ─┐
+//   | PromoteKinder()  |         |  EnrollKinder()  |
+//   └─ ─ ─ ─ ─ ─ ─ ─ ─ ┘         └ ─ ─ ─ ─ ─ ─ ─ ─ ─┘
+//             │                            │
+//             │                            │
+//             │                            │
+//             │                            │
+//             │   ┏━━━━━━━━━━━━━━━━━━━━┓   │
+//             └──▶┃   Kindrgtn Bucket  ┃◁──┘
+//                 ┗━━━━━━━━━━━━━━━━━━━━┛
+//                            │
+//                            |
+//                            ▼
+//                           ╱ ╲
+//                          ▕   ▏ Wait CSV + PublishTxn
+//                           ╲ ╱
+//                            │
+//                            │
+//                            ▼
+//                           .─.
+//                          (   )  waitForGraduation
+//                           `─'
+//                            │
+//                            │
+//                            ▼
+//                  ┌ ─ ─ ─ ─ ─ ─ ─ ─ ─ ┐
+//                  |  AwardDiplomas()  |
+//                  └ ─ ─ ─ ─ ─ ─ ─ ─ ─ ┘
+
 // ; CHAIN SEGMENTATION
 // ;
 // ; The root directory for a nursery store is first bucketed by the chain hash
