@@ -125,7 +125,7 @@ func newServer(listenAddrs []string, chanDB *channeldb.DB, cc *chainControl,
 			cc.chainNotifier,
 			cc.wallet,
 			cc.feeEstimator,
-			newNurseryStore(chanDB),
+			newNurseryStore(chanDB, &bitcoinGenesis),
 		),
 
 		identityPriv: privKey,
