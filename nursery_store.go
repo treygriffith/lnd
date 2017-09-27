@@ -11,6 +11,7 @@ import (
 )
 
 // ; CHAIN SEGMENTATION
+// ;
 // ; The root directory for a nursery store is first bucketed by the chain hash
 // ; with the 'utxon-' prefix. This allows multiple utxo nurseries for distinct
 // ; chains to simultaneously use the same database. This is critical for using
@@ -21,6 +22,7 @@ import (
 // utxon-<chain-hash>/
 // |
 // |   ; NURSERY-WIDE STATE VARIABLES
+// |   ;
 // |   ; Each nursery store tracks four distinct heights for both performance
 // |   ; and reliable fault tolerance. The oldest and youngest height keys allow
 // |   ; for efficient prefix scans of the height index. The last-attempted and
@@ -35,6 +37,7 @@ import (
 // ├── last-finalized-height-key: <last-finalized-height>
 // |
 // |   ; CHANNEL INDEX
+// |   ;
 // |   ; The channel index contains a directory for each channel that has a
 // |   ; non-zero number of outputs being tracked by the nursery store.
 // |   ; Inside each channel directory are files contains serialized spendable
@@ -56,6 +59,7 @@ import (
 // |       └── <prefix>-<outpoint-5>: <spendable-output>
 // |
 // |   ; HEIGHT INDEX
+// |   ;
 // |   ; The height index contains a directory for each height at which it still
 // |   ; has uncompleted actions. If an output is a baby or kindergarten output,
 // |   ; it will have an associated entry in the height index. Inside a
@@ -71,14 +75,14 @@ import (
 // └── height-index-key/
 //     ├── <height-1>/
 //     |   └── <chan-point-3>/
-//     |   |    ├── <outpoint-4>: <prefix>
-//     |   |    └── <outpoint-5>: <prefix>
+//     |   |    ├── <prefix>-<outpoint-4>
+//     |   |    └── <prefix>-<outpoint-5>
 //     |   └── <chan-point-2>/
-//     |        └── <outpoint-3>: <prefix>
+//     |        └── <prefix>-<outpoint-3>
 //     └── <height-2>/
 //         └── <chan-point-1>/
-//              └── <outpoint-1>: <prefix>
-//              └── <outpoint-2>: <prefix>
+//              └── <prefix>-<outpoint-1>
+//              └── <prefix>-<outpoint-2>
 
 var (
 	ErrBucketDoesNotExist = errors.New("bucket does not exist")
@@ -119,12 +123,12 @@ type NurseryStore interface {
 
 	ConceiveOutput(*babyOutput) error
 	FetchBirthingOutputs(height uint32) ([]babyOutput, error)
+	BirthToKinder(*babyOutput) error
 
-	PromotePreschool(*babyOutput) error
 	EnterPreschool(*kidOutput) error
 	ForEachPreschool(func(*kidOutput) error) error
+	PreschoolToKinder(*kidOutput) error
 
-	PromoteKinder(*kidOutput) error
 	FetchGraduatingOutputs(height uint32) ([]kidOutput, error)
 	AwardDiplomas([]kidOutput) error
 
@@ -161,15 +165,10 @@ func (ns *nurseryStore) ConceiveOutput(baby *babyOutput) error {
 			return err
 		}
 
-		var outputBuffer bytes.Buffer
-		if _, err := outputBuffer.Write(babyPrefix); err != nil {
-			return err
-		}
-		err = writeOutpoint(&outputBuffer, baby.OutPoint())
+		pfxOutputKey, err := prefixOutputKey(babyPrefix, baby.OutPoint())
 		if err != nil {
 			return err
 		}
-		outputBytes := outputBuffer.Bytes()
 
 		var babyBuffer bytes.Buffer
 		if err := baby.Encode(&babyBuffer); err != nil {
@@ -177,12 +176,13 @@ func (ns *nurseryStore) ConceiveOutput(baby *babyOutput) error {
 		}
 		babyBytes := babyBuffer.Bytes()
 
-		if err := chanBucket.Put(outputBytes, babyBytes); err != nil {
+		if err := chanBucket.Put(pfxOutputKey, babyBytes); err != nil {
 			return err
 		}
 
-		return hghtChanBucket.Put(outputBytes[4:], babyPrefix)
+		_, err = hghtChanBucket.CreateBucketIfNotExists(pfxOutputKey)
 
+		return err
 	})
 }
 
@@ -197,10 +197,7 @@ func (ns *nurseryStore) FetchBirthingOutputs(height uint32) ([]babyOutput, error
 
 		var channelBuckets [][]byte
 		if err := hghtBucket.ForEach(func(chanBytes, valBytes []byte) error {
-			if valBytes == nil {
-				channelBuckets = append(channelBuckets, chanBytes)
-			}
-
+			channelBuckets = append(channelBuckets, chanBytes)
 			return nil
 		}); err != nil {
 			return err
@@ -227,38 +224,25 @@ func (ns *nurseryStore) FetchBirthingOutputs(height uint32) ([]babyOutput, error
 				continue
 			}
 
-			err := hghtChanBucket.ForEach(func(output, prefix []byte) error {
-				if bytes.Compare(prefix, babyPrefix) != 0 {
-					return nil
-				}
+			c := hghtChanBucket.Cursor()
 
-				var keyBuffer bytes.Buffer
-				if _, err := keyBuffer.Write(babyPrefix); err != nil {
-					return err
-				}
-				if _, err := keyBuffer.Write(output); err != nil {
-					return err
-				}
-				keyBytes := keyBuffer.Bytes()
+			for k, _ := c.Seek(babyPrefix); k != nil &&
+				bytes.HasPrefix(k, babyPrefix); k, _ = c.Next() {
 
-				babyBytes := chanBucket.Get(keyBytes)
+				pfxOutputKey := k
+
+				babyBytes := chanBucket.Get(pfxOutputKey)
 				if babyBytes == nil {
-					return nil
+					continue
 				}
 
 				var baby babyOutput
-				babyReader := bytes.NewBuffer(babyBytes)
-				err := baby.Decode(babyReader)
+				err := baby.Decode(bytes.NewBuffer(babyBytes))
 				if err != nil {
 					return err
 				}
 
 				babies = append(babies, baby)
-
-				return nil
-			})
-			if err != nil {
-				return err
 			}
 		}
 
@@ -366,7 +350,7 @@ func (ns *nurseryStore) putLastFinalizedHeight(tx *bolt.Tx, height uint32) error
 	return chainBucket.Put(lastFinalizedHeightKey, lastHeightBytes[:])
 }
 
-func (ns *nurseryStore) PromotePreschool(baby *babyOutput) error {
+func (ns *nurseryStore) BirthToKinder(baby *babyOutput) error {
 	return ns.db.Update(func(tx *bolt.Tx) error {
 
 		chanPoint := baby.OriginChanPoint()
@@ -375,27 +359,27 @@ func (ns *nurseryStore) PromotePreschool(baby *babyOutput) error {
 			return err
 		}
 
-		hghtChanBucket, err := ns.createHeightChanBucket(tx,
+		pfxOutputKey, err := prefixOutputKey(babyPrefix, baby.OutPoint())
+		if err != nil {
+			return err
+		}
+
+		if err := chanBucket.Delete(pfxOutputKey); err != nil {
+			return err
+		}
+
+		hghtChanBucketOld, err := ns.createHeightChanBucket(tx,
 			baby.expiry, chanPoint)
 		if err != nil {
 			return err
 		}
 
-		var prefixOutputBuffer bytes.Buffer
-		if _, err := prefixOutputBuffer.Write(babyPrefix); err != nil {
-			return err
-		}
-		err = writeOutpoint(&prefixOutputBuffer, baby.OutPoint())
+		err = hghtChanBucketOld.DeleteBucket(pfxOutputKey)
 		if err != nil {
 			return err
 		}
-		prefixOutputBytes := prefixOutputBuffer.Bytes()
 
-		if err := chanBucket.Delete(prefixOutputBytes); err != nil {
-			return err
-		}
-
-		copy(prefixOutputBytes, psclPrefix)
+		copy(pfxOutputKey, kndrPrefix)
 
 		var kidBuffer bytes.Buffer
 		if err := baby.kidOutput.Encode(&kidBuffer); err != nil {
@@ -403,11 +387,18 @@ func (ns *nurseryStore) PromotePreschool(baby *babyOutput) error {
 		}
 		kidBytes := kidBuffer.Bytes()
 
-		if err := chanBucket.Put(prefixOutputBytes, kidBytes); err != nil {
+		if err := chanBucket.Put(pfxOutputKey, kidBytes); err != nil {
 			return err
 		}
 
-		err = hghtChanBucket.Delete(prefixOutputBytes[4:])
+		maturityHeight := baby.ConfHeight() + baby.BlocksToMaturity()
+		hghtChanBucketNew, err := ns.createHeightChanBucket(tx,
+			maturityHeight, chanPoint)
+		if err != nil {
+			return err
+		}
+
+		_, err = hghtChanBucketNew.CreateBucketIfNotExists(pfxOutputKey)
 		if err != nil {
 			return err
 		}
@@ -437,15 +428,10 @@ func (ns *nurseryStore) EnterPreschool(kid *kidOutput) error {
 			return err
 		}
 
-		var outputBuffer bytes.Buffer
-		if _, err := outputBuffer.Write(psclPrefix); err != nil {
-			return err
-		}
-		err = writeOutpoint(&outputBuffer, kid.OutPoint())
+		pfxOutputKey, err := prefixOutputKey(psclPrefix, kid.OutPoint())
 		if err != nil {
 			return err
 		}
-		outputBytes := outputBuffer.Bytes()
 
 		var kidBuffer bytes.Buffer
 		if err := kid.Encode(&kidBuffer); err != nil {
@@ -453,16 +439,37 @@ func (ns *nurseryStore) EnterPreschool(kid *kidOutput) error {
 		}
 		kidBytes := kidBuffer.Bytes()
 
-		return chanBucket.Put(outputBytes, kidBytes)
+		return chanBucket.Put(pfxOutputKey, kidBytes)
 	})
 }
 
-func (ns *nurseryStore) PromoteKinder(kid *kidOutput) error {
+func (ns *nurseryStore) PreschoolToKinder(kid *kidOutput) error {
 	return ns.db.Update(func(tx *bolt.Tx) error {
 
 		chanPoint := kid.OriginChanPoint()
 		chanBucket, err := ns.createChannelBucket(tx, chanPoint)
 		if err != nil {
+			return err
+		}
+
+		pfxOutputKey, err := prefixOutputKey(psclPrefix, kid.OutPoint())
+		if err != nil {
+			return err
+		}
+
+		if err := chanBucket.Delete(pfxOutputKey); err != nil {
+			return err
+		}
+
+		copy(pfxOutputKey, kndrPrefix)
+
+		var kidBuffer bytes.Buffer
+		if err := kid.Encode(&kidBuffer); err != nil {
+			return err
+		}
+		kidBytes := kidBuffer.Bytes()
+
+		if err := chanBucket.Put(pfxOutputKey, kidBytes); err != nil {
 			return err
 		}
 
@@ -473,33 +480,9 @@ func (ns *nurseryStore) PromoteKinder(kid *kidOutput) error {
 			return err
 		}
 
-		var prefixOutputBuffer bytes.Buffer
-		if _, err := prefixOutputBuffer.Write(psclPrefix); err != nil {
-			return err
-		}
-		err = writeOutpoint(&prefixOutputBuffer, kid.OutPoint())
-		if err != nil {
-			return err
-		}
-		prefixOutputBytes := prefixOutputBuffer.Bytes()
+		_, err = hghtChanBucket.CreateBucketIfNotExists(pfxOutputKey)
 
-		if err := chanBucket.Delete(prefixOutputBytes); err != nil {
-			return err
-		}
-
-		copy(prefixOutputBytes, kndrPrefix)
-
-		var kidBuffer bytes.Buffer
-		if err := kid.Encode(&kidBuffer); err != nil {
-			return err
-		}
-		kidBytes := kidBuffer.Bytes()
-
-		if err := chanBucket.Put(prefixOutputBytes, kidBytes); err != nil {
-			return err
-		}
-
-		return hghtChanBucket.Put(prefixOutputBytes[4:], kndrPrefix)
+		return err
 	})
 }
 
@@ -519,10 +502,7 @@ func (ns *nurseryStore) FetchGraduatingOutputs(height uint32) ([]kidOutput, erro
 
 		var channelBuckets [][]byte
 		if err := hghtBucket.ForEach(func(chanBytes, valBytes []byte) error {
-			if valBytes == nil {
-				channelBuckets = append(channelBuckets, chanBytes)
-			}
-
+			channelBuckets = append(channelBuckets, chanBytes)
 			return nil
 		}); err != nil {
 			return err
@@ -549,38 +529,25 @@ func (ns *nurseryStore) FetchGraduatingOutputs(height uint32) ([]kidOutput, erro
 				continue
 			}
 
-			err := hghtChanBucket.ForEach(func(output, prefix []byte) error {
-				if bytes.Compare(prefix, kndrPrefix) != 0 {
-					return nil
-				}
+			c := hghtChanBucket.Cursor()
 
-				var keyBuffer bytes.Buffer
-				if _, err := keyBuffer.Write(kndrPrefix); err != nil {
-					return err
-				}
-				if _, err := keyBuffer.Write(output); err != nil {
-					return err
-				}
-				keyBytes := keyBuffer.Bytes()
+			for k, _ := c.Seek(kndrPrefix); k != nil &&
+				bytes.HasPrefix(k, kndrPrefix); k, _ = c.Next() {
 
-				kidBytes := chanBucket.Get(keyBytes)
+				pfxOutputKey := k
+
+				kidBytes := chanBucket.Get(pfxOutputKey)
 				if kidBytes == nil {
-					return nil
+					continue
 				}
 
 				var kid kidOutput
-				kidReader := bytes.NewBuffer(kidBytes)
-				err := kid.Decode(kidReader)
+				err := kid.Decode(bytes.NewBuffer(kidBytes))
 				if err != nil {
 					return err
 				}
 
 				kids = append(kids, kid)
-
-				return nil
-			})
-			if err != nil {
-				return err
 			}
 		}
 
@@ -644,10 +611,7 @@ func (ns *nurseryStore) ForEachPreschool(cb func(kid *kidOutput) error) error {
 
 		var channelBuckets [][]byte
 		if err := chanIndex.ForEach(func(chanBytes, valBytes []byte) error {
-			if valBytes == nil {
-				channelBuckets = append(channelBuckets, chanBytes)
-			}
-
+			channelBuckets = append(channelBuckets, chanBytes)
 			return nil
 		}); err != nil {
 			return err
@@ -872,4 +836,18 @@ func (ns *nurseryStore) numChildrenInBucket(parent *bolt.Bucket) (int, error) {
 	}
 
 	return nChildren, nil
+}
+
+func prefixOutputKey(prefix []byte, outpoint *wire.OutPoint) ([]byte, error) {
+	var pfxdOutputBuffer bytes.Buffer
+	if _, err := pfxdOutputBuffer.Write(prefix); err != nil {
+		return nil, err
+	}
+
+	err := writeOutpoint(&pfxdOutputBuffer, outpoint)
+	if err != nil {
+		return nil, err
+	}
+
+	return pfxdOutputBuffer.Bytes(), nil
 }
