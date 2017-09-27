@@ -714,7 +714,7 @@ func testChannelBalance(net *networkHarness, t *harnessTest) {
 
 // testChannelForceClosure performs a test to exercise the behavior of "force"
 // closing a channel or unilaterally broadcasting the latest local commitment
-// state on-chain. The test creates a new channel between Alice and Bob, then
+// state on-chain. The test creates a new channel between Alice and Carol, then
 // force closes the channel after some cursory assertions. Within the test, two
 // transactions should be broadcast on-chain, the commitment transaction itself
 // (which closes the channel), and the sweep transaction a few blocks later
@@ -724,39 +724,142 @@ func testChannelBalance(net *networkHarness, t *harnessTest) {
 //
 // TODO(roasbeef): also add an unsettled HTLC before force closing.
 func testChannelForceClosure(net *networkHarness, t *harnessTest) {
-	timeout := time.Duration(time.Second * 10)
+
 	ctxb := context.Background()
+	const (
+		timeout     = time.Duration(time.Second * 10)
+		chanAmt     = btcutil.Amount(10e6)
+		pushAmt     = btcutil.Amount(5e6)
+		paymentAmt  = 100000
+		numInvoices = 6
+	)
 
-	// Before we start, obtain Bob's current wallet balance, we'll check to
-	// ensure that at the end of the force closure by Alice, Bob recognizes
+	// Since we'd like to test failure scenarios with outstanding htlcs,
+	// we'll introduce another node into our test network: Carol.
+	carol, err := net.NewNode([]string{"--debughtlc", "--hodlhtlc"})
+	if err != nil {
+		t.Fatalf("unable to create new nodes: %v", err)
+	}
+
+	// We must let Alice have an open channel before she can send a node
+	// announcement, so we open a channel with Carol,
+	if err := net.ConnectNodes(ctxb, net.Alice, carol); err != nil {
+		t.Fatalf("unable to connect alice to carol: %v", err)
+	}
+
+	// Before we start, obtain Carol's current wallet balance, we'll check to
+	// ensure that at the end of the force closure by Alice, Carol recognizes
 	// his new on-chain output.
-	bobBalReq := &lnrpc.WalletBalanceRequest{}
-	bobBalResp, err := net.Bob.WalletBalance(ctxb, bobBalReq)
+	carolBalReq := &lnrpc.WalletBalanceRequest{}
+	carolBalResp, err := carol.WalletBalance(ctxb, carolBalReq)
 	if err != nil {
-		t.Fatalf("unable to get bob's balance: %v", err)
+		t.Fatalf("unable to get carol's balance: %v", err)
 	}
-	bobStartingBalance := btcutil.Amount(bobBalResp.Balance * 1e8)
-
-	// First establish a channel with a capacity of 100k satoshis between
-	// Alice and Bob. We also push 50k satoshis of the initial amount
-	// towards Bob.
-	numFundingConfs := uint32(1)
-	chanAmt := btcutil.Amount(10e4)
-	pushAmt := btcutil.Amount(5e4)
-	chanOpenUpdate, err := net.OpenChannel(ctxb, net.Alice, net.Bob,
-		chanAmt, pushAmt)
-	if err != nil {
-		t.Fatalf("unable to open channel: %v", err)
-	}
-
-	if _, err := net.Miner.Node.Generate(numFundingConfs); err != nil {
-		t.Fatalf("unable to mine block: %v", err)
-	}
+	carolStartingBalance := btcutil.Amount(carolBalResp.Balance * 1e8)
 
 	ctxt, _ := context.WithTimeout(ctxb, timeout)
-	chanPoint, err := net.WaitForChannelOpen(ctxt, chanOpenUpdate)
+	chanPoint := openChannelAndAssert(ctxt, t, net, net.Alice, carol,
+		chanAmt, pushAmt)
+
+	// Wait for Alice to receive the channel edge from the funding manager.
+	ctxt, _ = context.WithTimeout(ctxb, timeout)
+	err = net.Alice.WaitForNetworkChannelOpen(ctxt, chanPoint)
 	if err != nil {
-		t.Fatalf("error while waiting for channel to open: %v", err)
+		t.Fatalf("alice didn't see the alice->carol channel before "+
+			"timeout: %v", err)
+	}
+
+	/*
+		// First establish a channel with a capacity of 100k satoshis between
+		// Alice and Carol. We also push 50k satoshis of the initial amount
+		// towards Carol.
+		numFundingConfs := uint32(1)
+		chanOpenUpdate, err := net.OpenChannel(ctxb, net.Alice, carol,
+			chanAmt, pushAmt)
+		if err != nil {
+			t.Fatalf("unable to open channel: %v", err)
+		}
+
+		if _, err := net.Miner.Node.Generate(numFundingConfs); err != nil {
+			t.Fatalf("unable to mine block: %v", err)
+		}
+
+		ctxt, _ := context.WithTimeout(ctxb, timeout)
+		chanPoint, err := net.WaitForChannelOpen(ctxt, chanOpenUpdate)
+		if err != nil {
+			t.Fatalf("error while waiting for channel to open: %v", err)
+		}
+	*/
+
+	// With the channel open, we'll create a few invoices for Carol that
+	// Alice will pay to in order to advance the state of the channel.
+	carolPaymentHashes := make([][]byte, numInvoices)
+	for i := 0; i < numInvoices; i++ {
+		preimage := bytes.Repeat([]byte{byte(128 - i)}, 32)
+		invoice := &lnrpc.Invoice{
+			Memo:      "testing",
+			RPreimage: preimage,
+			Value:     paymentAmt,
+		}
+		resp, err := carol.AddInvoice(ctxb, invoice)
+		if err != nil {
+			t.Fatalf("unable to add invoice: %v", err)
+		}
+
+		carolPaymentHashes[i] = resp.RHash
+	}
+
+	// As we'll be querying the state of Carols's channels frequently we'll
+	// create a closure helper function for the purpose.
+	getAliceChanInfo := func() (*lnrpc.ActiveChannel, error) {
+		req := &lnrpc.ListChannelsRequest{}
+		aliceChannelInfo, err := net.Alice.ListChannels(ctxb, req)
+		if err != nil {
+			return nil, err
+		}
+		if len(aliceChannelInfo.Channels) != 1 {
+			t.Fatalf("alice should only have a single channel, "+
+				"instead he has %v", len(aliceChannelInfo.Channels))
+		}
+
+		return aliceChannelInfo.Channels[0], nil
+	}
+
+	// Open up a payment stream to Alice that we'll use to send payment to
+	// Carol. We also create a small helper function to send payments to
+	// Carol, consuming the payment hashes we generated above.
+	alicePayStream, err := net.Alice.SendPayment(ctxb)
+	if err != nil {
+		t.Fatalf("unable to create payment stream for alice: %v", err)
+	}
+	sendPayments := func(start, stop int) error {
+		for i := start; i < stop; i++ {
+			sendReq := &lnrpc.SendRequest{
+				PaymentHash: carolPaymentHashes[i],
+				Dest:        carol.PubKey[:],
+				Amt:         paymentAmt,
+			}
+			if err := alicePayStream.Send(sendReq); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+
+	// Send payments from Alice to Carol, since Carol is htlchodl mode,
+	// the htlc outputs should be left unsettled, and should be swept by the
+	// utxo nursery.
+	if err := sendPayments(0, numInvoices); err != nil {
+		t.Fatalf("unable to send payment: %v", err)
+	}
+	time.Sleep(200 * time.Millisecond)
+
+	aliceChan, err := getAliceChanInfo()
+	if err != nil {
+		t.Fatalf("unable to get alice's channel info: %v", err)
+	}
+	if aliceChan.NumUpdates == 0 {
+		t.Fatalf("alice should see at least one update to her channel")
 	}
 
 	// Now that the channel is open, immediately execute a force closure of
@@ -929,6 +1032,15 @@ mempoolPoll:
 
 	assertTxInBlock(t, block, sweepTx.Hash())
 
+	cltvHeightDelta := defaultBitcoinForwardingPolicy.TimeLockDelta -
+		defaultCSV - 2
+
+	blockHash, err = net.Miner.Node.Generate(cltvHeightDelta)
+	if err != nil {
+		t.Fatalf("unable to generate block: %v", err)
+	}
+	time.Sleep(200 * time.Millisecond)
+
 	// Now that the channel has been fully swept, it should no longer show
 	// up within the pending channels RPC.
 	time.Sleep(time.Millisecond * 300)
@@ -940,17 +1052,18 @@ mempoolPoll:
 		t.Fatalf("no channels should be shown as force closed")
 	}
 
-	// At this point, Bob should now be aware of his new immediately
+	// At this point, Carol should now be aware of his new immediately
 	// spendable on-chain balance, as it was Alice who broadcast the
 	// commitment transaction.
-	bobBalResp, err = net.Bob.WalletBalance(ctxb, bobBalReq)
+	carolBalResp, err = net.Bob.WalletBalance(ctxb, carolBalReq)
 	if err != nil {
-		t.Fatalf("unable to get bob's balance: %v", err)
+		t.Fatalf("unable to get carol's balance: %v", err)
 	}
-	bobExpectedBalance := bobStartingBalance + pushAmt
-	if btcutil.Amount(bobBalResp.Balance*1e8) < bobExpectedBalance {
-		t.Fatalf("bob's balance is incorrect: expected %v got %v",
-			bobExpectedBalance, btcutil.Amount(bobBalResp.Balance*1e8))
+	carolExpectedBalance := carolStartingBalance + pushAmt
+	if btcutil.Amount(carolBalResp.Balance*1e8) < carolExpectedBalance {
+		t.Fatalf("carol's balance is incorrect: expected %v got %v",
+			carolExpectedBalance,
+			btcutil.Amount(carolBalResp.Balance*1e8))
 	}
 }
 
