@@ -33,6 +33,10 @@ const (
 	// HtlcAcceptedRevoke is a witness that allows us to sweep an HTLC
 	// output that we accepted from the counterparty.
 	HtlcAcceptedRevoke WitnessType = 4
+
+	// HtlcTimeLock is a witness that allows us to sweep an offered HTLC
+	// after entering the delay+claim stage.
+	HtlcTimeLock WitnessType = 5
 )
 
 // WitnessGenerator represents a function which is able to generate the final
