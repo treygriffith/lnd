@@ -1006,6 +1006,16 @@ func testChannelForceClosure(net *networkHarness, t *harnessTest) {
 
 	assertTxInBlock(t, block, sweepTx.Hash())
 
+	// Now that the commit output has been fully swept, check to see that the
+	// channel remains open for the pending htlc outputs.
+	pendingChans, err := net.Alice.PendingChannels(ctxb, pendingChansRequest)
+	if err != nil {
+		t.Fatalf("unable to query for pending channels: %v", err)
+	}
+	if len(pendingChans.PendingForceClosingChannels) != 1 {
+		t.Fatalf("channels should still be shown as force closed")
+	}
+
 	cltvHeightDelta := defaultBitcoinForwardingPolicy.TimeLockDelta -
 		defaultCSV - 3
 
@@ -1013,7 +1023,7 @@ func testChannelForceClosure(net *networkHarness, t *harnessTest) {
 	if err != nil {
 		t.Fatalf("unable to generate block: %v", err)
 	}
-	time.Sleep(200 * time.Millisecond)
+	time.Sleep(duration)
 
 	// The following restart checks to ensure that outputs in the kindergarten
 	// bucket are persisted while waiting for the required number of
@@ -1034,19 +1044,23 @@ func testChannelForceClosure(net *networkHarness, t *harnessTest) {
 	}
 
 	/*
-		// The following restart checks to ensure that outputs in the kindergarten
-		// bucket are persisted while waiting for the required number of
-		// confirmations to be reported.
-		if err := net.RestartNode(net.Alice, nil); err != nil {
-			t.Fatalf("Node restart failed: %v", err)
-		}
+	   // TODO(conner): uncomment once concrete error types have been implemented
+	   // in PublishTranscation. Currently generates errors on restarts.
+	   //
+	   // The following restart checks to ensure that outputs in the kindergarten
+	   // bucket are persisted while waiting for the required number of
+	   // confirmations to be reported.
+	   if err := net.RestartNode(net.Alice, nil); err != nil {
+	     t.Fatalf("Node restart failed: %v", err)
+	   }
+	   time.Sleep(duration)
 	*/
 
 	blockHash, err = net.Miner.Node.Generate(1)
 	if err != nil {
 		t.Fatalf("unable to generate block: %v", err)
 	}
-	time.Sleep(200 * time.Millisecond)
+	time.Sleep(duration)
 
 	// The following restart checks to ensure that outputs in the kindergarten
 	// bucket are persisted while waiting for the required number of
@@ -1071,11 +1085,45 @@ func testChannelForceClosure(net *networkHarness, t *harnessTest) {
 	if err != nil {
 		t.Fatalf("unable to generate block: %v", err)
 	}
+	time.Sleep(duration)
+
+	_, err = waitForTxInMempool(net.Miner.Node, 3*time.Second)
+	if err != nil {
+		t.Fatalf("failed to get sweep tx from mempool: %v", err)
+	}
+
+	/*
+	   // TODO(conner): uncomment once concrete error types have been implemented
+	   // in PublishTranscation. Currently generates errors on restarts.
+	   //
+	   // The following restart checks to ensure that outputs in the kindergarten
+	   // bucket are persisted while waiting for the required number of
+	   // confirmations to be reported.
+	   if err := net.RestartNode(net.Alice, nil); err != nil {
+	     t.Fatalf("Node restart failed: %v", err)
+	   }
+	   time.Sleep(duration)
+	*/
 
 	// Now that the channel has been fully swept, it should no longer show
 	// up within the pending channels RPC.
-	time.Sleep(time.Millisecond * 300)
-	pendingChans, err := net.Alice.PendingChannels(ctxb, pendingChansRequest)
+	pendingChans, err = net.Alice.PendingChannels(ctxb, pendingChansRequest)
+	if err != nil {
+		t.Fatalf("unable to query for pending channels: %v", err)
+	}
+	if len(pendingChans.PendingForceClosingChannels) != 1 {
+		t.Fatalf("channels should still be shown as force closed")
+	}
+
+	blockHash, err = net.Miner.Node.Generate(1)
+	if err != nil {
+		t.Fatalf("unable to generate block: %v", err)
+	}
+	time.Sleep(duration)
+
+	// Now that the channel has been fully swept, it should no longer show
+	// up within the pending channels RPC.
+	pendingChans, err = net.Alice.PendingChannels(ctxb, pendingChansRequest)
 	if err != nil {
 		t.Fatalf("unable to query for pending channels: %v", err)
 	}
