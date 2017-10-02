@@ -1754,6 +1754,44 @@ poll:
 	return txid, nil
 }
 
+func waitForNTxsInMempool(miner *rpcclient.Client, n int,
+	timeout time.Duration) ([]chainhash.Hash, error) {
+
+	breakTimeout := time.After(timeout)
+	ticker := time.NewTicker(50 * time.Millisecond)
+	defer ticker.Stop()
+
+	var txidSet = make(map[chainhash.Hash]struct{})
+poll:
+	for {
+		select {
+		case <-breakTimeout:
+			return nil, fmt.Errorf("wanted %v, only found %v txs "+
+				"in mempool", n, len(txidSet))
+		case <-ticker.C:
+			mempool, err := miner.GetRawMempool()
+			if err != nil {
+				return nil, err
+			}
+
+			for _, txid := range mempool {
+				txidSet[*txid] = struct{}{}
+			}
+
+			if len(txidSet) == n {
+				break poll
+			}
+		}
+	}
+
+	var txids = make([]chainhash.Hash, 0, len(txidSet))
+	for txid := range txidSet {
+		txids = append(txids, txid)
+	}
+
+	return txids, nil
+}
+
 // testRevokedCloseRetributinPostBreachConf tests that Alice is able carry out
 // retribution in the event that she fails immediately after detecting Bob's
 // breach txn in the mempool.
