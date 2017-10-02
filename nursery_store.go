@@ -145,9 +145,6 @@ var (
 )
 
 var (
-	youngestHeightKey      = []byte("youngest-height-key")
-	oldestHeightKey        = []byte("oldest-height-key")
-	lastAttemptedHeightKey = []byte("last-attempted-height-key")
 	lastFinalizedHeightKey = []byte("last-finalized-height-key")
 
 	babyPrefix = []byte("bby-")
@@ -179,7 +176,7 @@ type NurseryStore interface {
 	EnterPreschool(*kidOutput) error
 	PreschoolToKinder(*kidOutput) error
 
-	AwardDiplomas([]kidOutput) error
+	AwardDiplomas([]kidOutput) ([]wire.OutPoint, error)
 	FinalizeClass(height uint32) error
 
 	ForChanOutputs(*wire.OutPoint, func([]byte, []byte) error) error
@@ -374,6 +371,7 @@ func (ns *nurseryStore) PreschoolToKinder(kid *kidOutput) error {
 }
 
 func (ns *nurseryStore) FinalizeClass(height uint32) error {
+	utxnLog.Infof("Finalizing class at height %v", height)
 	return ns.db.Update(func(tx *bolt.Tx) error {
 		return ns.putLastFinalizedHeight(tx, height)
 	})
@@ -626,28 +624,52 @@ func (ns *nurseryStore) FetchKindergartens(height uint32) ([]kidOutput, error) {
 	return kids, nil
 }
 
-func (ns *nurseryStore) AwardDiplomas(kids []kidOutput) error {
-	return ns.db.Update(func(tx *bolt.Tx) error {
+func (ns *nurseryStore) AwardDiplomas(
+	kids []kidOutput) ([]wire.OutPoint, error) {
+
+	var closedChannelSet = make(map[wire.OutPoint]struct{})
+	if err := ns.db.Update(func(tx *bolt.Tx) error {
 		for _, kid := range kids {
 			err := ns.pruneHeight(tx, kid.ConfHeight())
 			switch err {
 			case nil, ErrBucketDoesNotExist, ErrBucketNotEmpty:
-				continue
+				break
+				utxnLog.Infof("Height bucket %d pruned", kid.ConfHeight())
 			default:
 				return err
 			}
 
-			err = ns.pruneChannel(tx, kid.OriginChanPoint())
+			outpoint := kid.OutPoint()
+			chanPoint := kid.OriginChanPoint()
+
+			err = ns.pruneChannel(tx, chanPoint, outpoint)
 			switch err {
-			case nil, ErrBucketDoesNotExist, ErrBucketNotEmpty:
+			case ErrBucketNotEmpty:
+				utxnLog.Infof("Channel bucket %x not empty", chanPoint)
 				continue
+			case nil, ErrBucketDoesNotExist:
+				utxnLog.Infof("Channel bucket %x does not exist", chanPoint)
+				break
 			default:
 				return err
 			}
+
+			closedChannelSet[*chanPoint] = struct{}{}
 		}
 
 		return nil
-	})
+	}); err != nil {
+		return nil, err
+	}
+
+	var closedChannels = make([]wire.OutPoint, 0, len(closedChannelSet))
+	for chanPoint := range closedChannelSet {
+		closedChannels = append(closedChannels, chanPoint)
+	}
+
+	utxnLog.Infof("Channels needing close: %x", closedChannels)
+
+	return closedChannels, nil
 }
 
 func (ns *nurseryStore) createChannelBucket(tx *bolt.Tx,
@@ -693,7 +715,7 @@ func (ns *nurseryStore) getChannelBucket(tx *bolt.Tx,
 }
 
 func (ns *nurseryStore) pruneChannel(tx *bolt.Tx,
-	chanPoint *wire.OutPoint) error {
+	chanPoint, outpoint *wire.OutPoint) error {
 
 	chainBucket := tx.Bucket(ns.chainHash[:])
 	if chainBucket == nil {
@@ -709,8 +731,23 @@ func (ns *nurseryStore) pruneChannel(tx *bolt.Tx,
 	if err := writeOutpoint(&chanBuffer, chanPoint); err != nil {
 		return err
 	}
+	chanBytes := chanBuffer.Bytes()
 
-	return ns.removeBucketIfEmpty(chanIndex, chanBuffer.Bytes())
+	chanBucket := chanIndex.Bucket(chanBytes)
+	if chanBucket == nil {
+		return nil
+	}
+
+	pfxOutputBytes, err := prefixOutputKey(kndrPrefix, outpoint)
+	if err != nil {
+		return err
+	}
+
+	if err := chanBucket.Delete(pfxOutputBytes); err != nil {
+		return err
+	}
+
+	return ns.removeBucketIfEmpty(chanIndex, chanBytes)
 }
 
 func (ns *nurseryStore) createHeightBucket(tx *bolt.Tx,
@@ -824,6 +861,8 @@ func (ns *nurseryStore) removeBucketIfEmpty(parent *bolt.Bucket,
 		return err
 	}
 
+	utxnLog.Infof("num children in bucket: %v", nChildren)
+
 	if nChildren > 0 {
 		return ErrBucketNotEmpty
 	}
@@ -844,15 +883,15 @@ func (ns *nurseryStore) numChildrenInBucket(parent *bolt.Bucket) (int, error) {
 }
 
 func prefixOutputKey(prefix []byte, outpoint *wire.OutPoint) ([]byte, error) {
-	var pfxdOutputBuffer bytes.Buffer
-	if _, err := pfxdOutputBuffer.Write(prefix); err != nil {
+	var pfxOutputBuffer bytes.Buffer
+	if _, err := pfxOutputBuffer.Write(prefix); err != nil {
 		return nil, err
 	}
 
-	err := writeOutpoint(&pfxdOutputBuffer, outpoint)
+	err := writeOutpoint(&pfxOutputBuffer, outpoint)
 	if err != nil {
 		return nil, err
 	}
 
-	return pfxdOutputBuffer.Bytes(), nil
+	return pfxOutputBuffer.Bytes(), nil
 }
