@@ -3,7 +3,6 @@ package main
 import (
 	"bytes"
 	"encoding/binary"
-	"errors"
 	"fmt"
 	"io"
 	"sync"
@@ -14,6 +13,7 @@ import (
 	"github.com/lightningnetwork/lnd/chainntnfs"
 	"github.com/lightningnetwork/lnd/channeldb"
 	"github.com/lightningnetwork/lnd/lnwallet"
+	"github.com/roasbeef/btcd/blockchain"
 	"github.com/roasbeef/btcd/txscript"
 	"github.com/roasbeef/btcd/wire"
 	"github.com/roasbeef/btcutil"
@@ -84,14 +84,14 @@ var (
 // the source wallet, returning the outputs so they can be used within future
 // channels, or regular Bitcoin transactions.
 type utxoNursery struct {
-	sync.RWMutex
+	mu            sync.Mutex
+	currentHeight uint32
+	db            *channeldb.DB
 
-	notifier chainntnfs.ChainNotifier
-	wallet   *lnwallet.LightningWallet
-
-	db *channeldb.DB
-
-	requests chan *incubationRequest
+	notifier  chainntnfs.ChainNotifier
+	wallet    *lnwallet.LightningWallet
+	estimator lnwallet.FeeEstimator
+	store     NurseryStore
 
 	started uint32
 	stopped uint32
@@ -102,14 +102,16 @@ type utxoNursery struct {
 // newUtxoNursery creates a new instance of the utxoNursery from a
 // ChainNotifier and LightningWallet instance.
 func newUtxoNursery(db *channeldb.DB, notifier chainntnfs.ChainNotifier,
-	wallet *lnwallet.LightningWallet) *utxoNursery {
+	wallet *lnwallet.LightningWallet,
+	fe lnwallet.FeeEstimator, ns NurseryStore) *utxoNursery {
 
 	return &utxoNursery{
-		notifier: notifier,
-		wallet:   wallet,
-		requests: make(chan *incubationRequest),
-		db:       db,
-		quit:     make(chan struct{}),
+		notifier:  notifier,
+		wallet:    wallet,
+		estimator: fe,
+		store:     ns,
+		db:        db,
+		quit:      make(chan struct{}),
 	}
 }
 
@@ -126,20 +128,7 @@ func (u *utxoNursery) Start() error {
 	// this to strict the search space when asking for confirmation
 	// notifications, and also to scan the chain to graduate now mature
 	// outputs.
-	var lastGraduatedHeight uint32
-	err := u.db.View(func(tx *bolt.Tx) error {
-		kgtnBucket := tx.Bucket(kindergartenBucket)
-		if kgtnBucket == nil {
-			return nil
-		}
-		heightBytes := kgtnBucket.Get(lastGraduatedHeightKey)
-		if heightBytes == nil {
-			return nil
-		}
-
-		lastGraduatedHeight = byteOrder.Uint32(heightBytes)
-		return nil
-	})
+	lastGraduatedHeight, err := u.store.LastAttemptedHeight()
 	if err != nil {
 		return err
 	}
@@ -166,36 +155,40 @@ func (u *utxoNursery) Start() error {
 	return nil
 }
 
+// Stop gracefully shuts down any lingering goroutines launched during normal
+// operation of the utxoNursery.
+func (u *utxoNursery) Stop() error {
+	if !atomic.CompareAndSwapUint32(&u.stopped, 0, 1) {
+		return nil
+	}
+
+	utxnLog.Infof("UTXO nursery shutting down")
+
+	close(u.quit)
+	u.wg.Wait()
+
+	return nil
+}
+
 // reloadPreschool re-initializes the chain notifier with all of the outputs
 // that had been saved to the "preschool" database bucket prior to shutdown.
 func (u *utxoNursery) reloadPreschool(heightHint uint32) error {
-	return u.db.View(func(tx *bolt.Tx) error {
-		psclBucket := tx.Bucket(preschoolBucket)
-		if psclBucket == nil {
-			return nil
+	return u.store.ForEachPreschool(func(kid *kidOutput) error {
+		txID := kid.OutPoint().Hash
+
+		confChan, err := u.notifier.RegisterConfirmationsNtfn(
+			&txID, 1, heightHint)
+		if err != nil {
+			return err
 		}
 
-		return psclBucket.ForEach(func(outputBytes, kidBytes []byte) error {
-			var psclOutput kidOutput
-			err := psclOutput.Decode(bytes.NewBuffer(kidBytes))
-			if err != nil {
-				return err
-			}
+		utxnLog.Infof("Preschool outpoint %v re-registered for confirmation "+
+			"notification.", kid.OutPoint())
 
-			sourceTxid := psclOutput.OutPoint().Hash
+		u.wg.Add(1)
+		go u.waitForPromotion(kid, confChan)
 
-			confChan, err := u.notifier.RegisterConfirmationsNtfn(
-				&sourceTxid, 1, heightHint,
-			)
-			if err != nil {
-				return err
-			}
-
-			utxnLog.Infof("Preschool outpoint %v re-registered for confirmation "+
-				"notification.", psclOutput.OutPoint())
-			go psclOutput.waitForPromotion(u.db, confChan)
-			return nil
-		})
+		return nil
 	})
 }
 
@@ -235,36 +228,204 @@ func (u *utxoNursery) catchUpKindergarten(lastGraduatedHeight uint32) error {
 	return nil
 }
 
-// Stop gracefully shuts down any lingering goroutines launched during normal
-// operation of the utxoNursery.
-func (u *utxoNursery) Stop() error {
-	if !atomic.CompareAndSwapUint32(&u.stopped, 0, 1) {
-		return nil
+// graduateKindergarten handles the steps invoked with moving funds from a
+// force close commitment transaction into a user's wallet after the output
+// from the commitment transaction has become spendable. graduateKindergarten
+// is called both when a new block notification has been received and also at
+// startup in order to process graduations from blocks missed while the UTXO
+// nursery was offline.
+// TODO(roasbeef): single db transaction for the below
+func (u *utxoNursery) graduateKindergarten(blockHeight uint32) error {
+
+	// Immediately mark that we are attempting to process this block height.
+	// During restarts, this will allow the utxo nursery to re-initialize
+	// any tasks that are required to completely finish processing the
+	// outputs at this height.
+	if err := u.store.BeginCeremony(blockHeight); err != nil {
+		return err
 	}
 
-	utxnLog.Infof("UTXO nursery shutting down")
+	// First fetch the set of outputs that we can "graduate" at this
+	// particular block height. We can graduate an output once we've
+	// reached its height maturity.
+	kgtnOutputs, err := u.store.FetchGraduatingOutputs(blockHeight)
+	if err != nil {
+		return err
+	}
 
-	close(u.quit)
-	u.wg.Wait()
+	// If we're able to graduate any outputs, then create a single
+	// transaction which sweeps them all into the wallet.
+	if len(kgtnOutputs) > 0 {
+		err := u.sweepGraduatingOutputs(kgtnOutputs)
+		if err != nil {
+			return err
+		}
+	}
+
+	wombOutputs, err := u.store.FetchBirthingOutputs(blockHeight)
+	if err != nil {
+		return err
+	}
+
+	for i := range wombOutputs {
+		output := &wombOutputs[i]
+
+		// Broadcast transaction, canceling notification if we fail
+		err = u.wallet.PublishTransaction(output.timeoutTx)
+		if err != nil {
+			utxnLog.Errorf("unable to broadcast womb tx: "+
+				"%v, %v", err,
+				spew.Sdump(output.timeoutTx))
+			return err
+		}
+
+		birthTxID := output.OutPoint().Hash
+
+		// Register for the confirmation of womb tx
+		confChan, err := u.notifier.RegisterConfirmationsNtfn(
+			&birthTxID, 1, blockHeight,
+		)
+		if err != nil {
+			return err
+		}
+
+		utxnLog.Infof("Womb output %v registered for promotion "+
+			"notification.", output.OutPoint())
+
+		u.wg.Add(1)
+		go u.waitForBirth(output, confChan)
+
+	}
 
 	return nil
 }
 
-// incubationRequest is a request to the utxoNursery to incubate a set of
-// outputs until their mature, finally sweeping them into the wallet once
-// available.
-type incubationRequest struct {
-	outputs []*kidOutput
+// sweepGraduatingOutputs generates and broadcasts the transaction that
+// transfers control of funds from a channel commitment transaction to the
+// user's wallet.
+func (u *utxoNursery) sweepGraduatingOutputs(kgtnOutputs []kidOutput) error {
+	// Create a transaction which sweeps all the newly mature outputs into
+	// a output controlled by the wallet.
+	// TODO(roasbeef): can be more intelligent about buffering outputs to
+	// be more efficient on-chain.
+	inputs := make([]TLockSpendableOutput, 0, len(kgtnOutputs))
+	for i := range kgtnOutputs {
+		inputs = append(inputs, &kgtnOutputs[i])
+	}
+
+	sweepTx, err := u.createSweepTx(inputs)
+	if err != nil {
+		// TODO(roasbeef): retry logic?
+		utxnLog.Errorf("unable to create sweep tx: %v", err)
+		return err
+	}
+
+	utxnLog.Infof("Sweeping %v time-locked outputs "+
+		"with sweep tx (txid=%v): %v", len(kgtnOutputs),
+		sweepTx.TxHash(),
+		newLogClosure(func() string {
+			return spew.Sdump(sweepTx)
+		}))
+
+	// With the sweep transaction fully signed, broadcast the transaction
+	// to the network. Additionally, we can stop tracking these outputs as
+	// they've just been swept.
+	if err := u.wallet.PublishTransaction(sweepTx); err != nil {
+		utxnLog.Errorf("unable to broadcast sweep tx: %v, %v",
+			err, spew.Sdump(sweepTx))
+		return err
+	}
+
+	sweepTxID := sweepTx.TxHash()
+
+	confChan, err := u.notifier.RegisterConfirmationsNtfn(
+		&sweepTxID, 1, u.currentHeight)
+	if err != nil {
+		utxnLog.Errorf("unable to register notification for "+
+			"sweep confirmation: %v", sweepTxID)
+		return err
+	}
+
+	u.wg.Add(1)
+	go u.waitForGraduation(kgtnOutputs, confChan)
+
+	return nil
+}
+
+// createSweepTx creates a final sweeping transaction with all witnesses in
+// place for all inputs. The created transaction has a single output sending
+// all the funds back to the source wallet.
+func (u *utxoNursery) createSweepTx(
+	inputs []TLockSpendableOutput) (*wire.MsgTx, error) {
+
+	pkScript, err := newSweepPkScript(u.wallet)
+	if err != nil {
+		return nil, err
+	}
+
+	var totalSum btcutil.Amount
+	for _, o := range inputs {
+		totalSum += o.Amount()
+	}
+
+	sweepTx := wire.NewMsgTx(2)
+	sweepTx.AddTxOut(&wire.TxOut{
+		PkScript: pkScript,
+		Value:    int64(totalSum - 5000),
+	})
+	for _, input := range inputs {
+		sweepTx.AddTxIn(&wire.TxIn{
+			PreviousOutPoint: *input.OutPoint(),
+			// TODO(roasbeef): assumes pure block delays
+			Sequence: input.BlocksToMaturity(),
+		})
+	}
+
+	// Before signing the transaction, check to ensure that it meets some
+	// basic validity requirements.
+	btx := btcutil.NewTx(sweepTx)
+	if err := blockchain.CheckTransactionSanity(btx); err != nil {
+		return nil, err
+	}
+
+	// TODO(roasbeef): insert fee calculation
+	//  * remove hardcoded fee above
+
+	hashCache := txscript.NewTxSigHashes(sweepTx)
+
+	// With all the inputs in place, use each output's unique witness
+	// function to generate the final witness required for spending.
+
+	addWitness := func(idx int, tso TLockSpendableOutput) error {
+		witness, err := tso.BuildWitness(u.wallet.Cfg.Signer, sweepTx,
+			hashCache, idx)
+		if err != nil {
+			return err
+		}
+
+		sweepTx.TxIn[idx].Witness = witness
+
+		return nil
+	}
+
+	for i, input := range inputs {
+		if err := addWitness(i, input); err != nil {
+			return nil, err
+		}
+	}
+
+	return sweepTx, nil
 }
 
 // incubateOutputs sends a request to utxoNursery to incubate the outputs
 // defined within the summary of a closed channel. Individually, as all outputs
 // reach maturity they'll be swept back into the wallet.
 func (u *utxoNursery) IncubateOutputs(closeSummary *lnwallet.ForceCloseSummary) {
-	var incReq incubationRequest
+	u.mu.Lock()
+	defer u.mu.Unlock()
 
-	// It could be that our to-self output was below the dust limit. In
-	// that case the SignDescriptor would be nil and we would not have that
+	// It could be that our to-self output was below the dust limit. In that
+	// case the SignDescriptor would be nil and we would not have that
 	// output to incubate.
 	if closeSummary.SelfOutputSignDesc != nil {
 		selfOutput := makeKidOutput(
@@ -275,13 +436,74 @@ func (u *utxoNursery) IncubateOutputs(closeSummary *lnwallet.ForceCloseSummary) 
 			closeSummary.SelfOutputSignDesc,
 		)
 
-		incReq.outputs = append(incReq.outputs, &selfOutput)
+		// We'll skip any zero value'd outputs as this indicates we
+		// don't have a settled balance within the commitment
+		// transaction.
+		if selfOutput.Amount() == 0 {
+			goto wombOutputs
+		}
+
+		sourceTxid := selfOutput.OutPoint().Hash
+
+		err := u.store.EnterPreschool(&selfOutput)
+		if err != nil {
+			utxnLog.Errorf("unable to add kidOutput "+
+				"to new preschool: %v, %v", selfOutput, err)
+			goto wombOutputs
+		}
+
+		// Register for a notification that will trigger graduation from
+		// preschool to kindergarten when the channel close transaction
+		// has been confirmed.
+		confChan, err := u.notifier.RegisterConfirmationsNtfn(
+			&sourceTxid, 1, u.currentHeight)
+		if err != nil {
+			utxnLog.Errorf("unable to register output for "+
+				"confirmation: %v", sourceTxid)
+			goto wombOutputs
+		}
+
+		utxnLog.Infof("Added kid output to pscl: %v",
+			selfOutput.OutPoint())
+
+		// Launch a dedicated goroutine that will move the output from
+		// the preschool bucket to the kindergarten bucket once the
+		// channel close transaction has been confirmed.
+		u.wg.Add(1)
+		go u.waitForPromotion(&selfOutput, confChan)
 	}
 
-	// If there are no outputs to incubate, there is nothing to send to the
-	// request channel.
-	if len(incReq.outputs) != 0 {
-		u.requests <- &incReq
+wombOutputs:
+	for i := range closeSummary.HtlcResolutions {
+		htlcRes := closeSummary.HtlcResolutions[i]
+
+		htlcOutpoint := &wire.OutPoint{
+			Hash:  htlcRes.SignedTimeoutTx.TxHash(),
+			Index: 0,
+		}
+
+		utxnLog.Infof("htlc resolution with expiry: %v",
+			htlcRes.Expiry)
+
+		htlcOutput := makeWombOutput(
+			htlcOutpoint,
+			&closeSummary.ChanPoint,
+			closeSummary.SelfOutputMaturity,
+			lnwallet.HtlcOfferedTimeLock,
+			&htlcRes,
+		)
+
+		if htlcOutput.Amount() == 0 {
+			continue
+		}
+
+		err := u.store.ConceiveOutput(&htlcOutput)
+		if err != nil {
+			continue
+		}
+
+		utxnLog.Infof("Added htlc output to womb: %v",
+			htlcOutput.OutPoint())
 	}
 }
 
@@ -299,51 +521,10 @@ func (u *utxoNursery) incubator(newBlockChan *chainntnfs.BlockEpochEvent,
 	defer u.wg.Done()
 	defer newBlockChan.Cancel()
 
-	currentHeight := startingHeight
+	u.currentHeight = startingHeight
 out:
 	for {
 		select {
-
-		case preschoolRequest := <-u.requests:
-			utxnLog.Infof("Incubating %v new outputs",
-				len(preschoolRequest.outputs))
-
-			for _, output := range preschoolRequest.outputs {
-				// We'll skip any zero value'd outputs as this
-				// indicates we don't have a settled balance
-				// within the commitment transaction.
-				if output.Amount() == 0 {
-					continue
-				}
-
-				sourceTxid := output.OutPoint().Hash
-
-				if err := output.enterPreschool(u.db); err != nil {
-					utxnLog.Errorf("unable to add kidOutput to preschool: %v, %v ",
-						output, err)
-					continue
-				}
-
-				// Register for a notification that will
-				// trigger graduation from preschool to
-				// kindergarten when the channel close
-				// transaction has been confirmed.
-				confChan, err := u.notifier.RegisterConfirmationsNtfn(
-					&sourceTxid, 1, currentHeight,
-				)
-				if err != nil {
-					utxnLog.Errorf("unable to register output for confirmation: %v",
-						sourceTxid)
-					continue
-				}
-
-				// Launch a dedicated goroutine that will move
-				// the output from the preschool bucket to the
-				// kindergarten bucket once the channel close
-				// transaction has been confirmed.
-				go output.waitForPromotion(u.db, confChan)
-			}
-
 		case epoch, ok := <-newBlockChan.Epochs:
 			// If the epoch channel has been closed, then the
 			// ChainNotifier is exiting which means the daemon is
@@ -362,11 +543,14 @@ out:
 			// outputs out of the kindergarten bucket. Graduation
 			// entails successfully sweeping a time-locked output.
 			height := uint32(epoch.Height)
-			currentHeight = height
+
+			u.mu.Lock()
+			u.currentHeight = height
 			if err := u.graduateKindergarten(height); err != nil {
 				utxnLog.Errorf("error while graduating "+
 					"kindergarten outputs: %v", err)
 			}
+			u.mu.Unlock()
 
 		case <-u.quit:
 			break out
@@ -393,8 +577,8 @@ type contractMaturityReport struct {
 	// reach maturity.
 	maturityRequirement uint32
 
-	// maturityHeight is the absolute block height that this output will
-	// mature at.
+	// maturityHeight is the absolute block height that this output will mature
+	// at.
 	maturityHeight uint32
 }
 
@@ -402,99 +586,45 @@ type contractMaturityReport struct {
 // outpoint. A nursery report details the maturity/sweeping progress for a
 // contract that was previously force closed. If a report entry for the target
 // chanPoint is unable to be constructed, then an error will be returned.
-func (u *utxoNursery) NurseryReport(chanPoint *wire.OutPoint) (*contractMaturityReport, error) {
+func (u *utxoNursery) NurseryReport(
+	chanPoint *wire.OutPoint) (*contractMaturityReport, error) {
+
 	var report *contractMaturityReport
-	if err := u.db.View(func(tx *bolt.Tx) error {
-		// First we'll examine the preschool bucket as the target
-		// contract may not yet have been confirmed.
-		psclBucket := tx.Bucket(preschoolBucket)
-		if psclBucket == nil {
-			return nil
-		}
-		psclIndex := tx.Bucket(preschoolIndex)
-		if psclIndex == nil {
-			return nil
-		}
+	if err := u.store.ForChanOutputs(chanPoint, func(k, v []byte) error {
+		var prefix [4]byte
+		copy(prefix[:], k[:4])
 
-		var b bytes.Buffer
-		if err := writeOutpoint(&b, chanPoint); err != nil {
-			return err
-		}
-		chanPointBytes := b.Bytes()
+		switch string(prefix[:]) {
+		case string(psclPrefix), string(kndrPrefix):
 
-		var outputReader *bytes.Reader
-
-		// If the target contract hasn't been confirmed yet, then we
-		// can just construct the report from this information.
-		if outPoint := psclIndex.Get(chanPointBytes); outPoint != nil {
-			// The channel entry hasn't yet been fully confirmed
-			// yet, so we'll dig into the preschool bucket to fetch
-			// the channel information.
-			outputBytes := psclBucket.Get(outPoint)
-			if outputBytes == nil {
-				return nil
+			// information for this immature output.
+			var kid kidOutput
+			kidReader := bytes.NewReader(v)
+			err := kid.Decode(kidReader)
+			if err != nil {
+				return err
 			}
 
-			outputReader = bytes.NewReader(outputBytes)
-		} else {
-			// Otherwise, we'll have to consult out contract index,
-			// so fetch that bucket as well as the kindergarten
-			// bucket.
-			indexBucket := tx.Bucket(contractIndex)
-			if indexBucket == nil {
-				return fmt.Errorf("contract not found, " +
-					"contract index not populated")
-			}
-			kgtnBucket := tx.Bucket(kindergartenBucket)
-			if kgtnBucket == nil {
-				return fmt.Errorf("contract not found, " +
-					"kindergarten bucket not populated")
+			utxnLog.Infof("NurseryReport: found kid output: %v",
+				kid.OutPoint())
+
+			// TODO(roasbeef): should actually be list of outputs
+			report = &contractMaturityReport{
+				chanPoint:           *chanPoint,
+				limboBalance:        kid.Amount(),
+				maturityRequirement: kid.BlocksToMaturity(),
 			}
 
-			// Attempt to query the index to see if we have an
-			// entry for this particular contract.
-			indexInfo := indexBucket.Get(chanPointBytes)
-			if indexInfo == nil {
-				return ErrContractNotFound
+			// If the confirmation height is set, then this means the
+			// contract has been confirmed, and we know the final maturity
+			// height.
+			if kid.ConfHeight() != 0 {
+				report.confirmationHeight = kid.ConfHeight()
+				report.maturityHeight = (kid.BlocksToMaturity() +
+					kid.ConfHeight())
 			}
-
-			// If an entry is found, then using the height store in
-			// the first 4 bytes, we'll fetch the height that this
-			// entry matures at.
-			height := indexInfo[:4]
-			heightRow := kgtnBucket.Get(height)
-			if heightRow == nil {
-				return ErrContractNotFound
-			}
-
-			// Once we have the entry itself, we'll slice of the
-			// last for bytes so we can seek into this row to fetch
-			// the contract's information.
-			offset := byteOrder.Uint32(indexInfo[4:])
-			outputReader = bytes.NewReader(heightRow[offset:])
-		}
-
-		// With the proper set of bytes received, we'll deserialize the
-		// information for this immature output.
-		var immatureOutput kidOutput
-		if err := immatureOutput.Decode(outputReader); err != nil {
-			return err
-		}
-
-		// TODO(roasbeef): should actually be list of outputs
-		report = &contractMaturityReport{
-			chanPoint:           *chanPoint,
-			limboBalance:        immatureOutput.Amount(),
-			maturityRequirement: immatureOutput.BlocksToMaturity(),
-		}
-
-		// If the confirmation height is set, then this means the
-		// contract has been confirmed, and we know the final maturity
-		// height.
-		if immatureOutput.ConfHeight() != 0 {
-			report.confirmationHeight = immatureOutput.ConfHeight()
-			report.maturityHeight = (immatureOutput.BlocksToMaturity() +
-				immatureOutput.ConfHeight())
+		case string(wombPrefix):
+		default:
 		}
 
 		return nil
@@ -505,54 +635,39 @@ func (u *utxoNursery) NurseryReport(chanPoint *wire.OutPoint) (*contractMaturity
 	return report, nil
 }
 
-// enterPreschool is the first stage in the process of transferring funds from
-// a force closed channel into the user's wallet. When an output is in the
-// "preschool" stage, the daemon is waiting for the initial confirmation of the
-// commitment transaction.
-func (k *kidOutput) enterPreschool(db *channeldb.DB) error {
-	return db.Update(func(tx *bolt.Tx) error {
-		psclBucket, err := tx.CreateBucketIfNotExists(preschoolBucket)
-		if err != nil {
-			return err
-		}
-		psclIndex, err := tx.CreateBucketIfNotExists(preschoolIndex)
-		if err != nil {
-			return err
+func (u *utxoNursery) waitForBirth(womb *wombOutput,
+	confChan *chainntnfs.ConfirmationEvent) {
+
+	defer u.wg.Done()
+
+	select {
+	case txConfirmation, ok := <-confChan.Confirmed:
+		if !ok {
+			utxnLog.Errorf("Notification chan "+
+				"closed, can't advance womb output %v",
+				womb.OutPoint())
+			return
 		}
 
-		// Once we have the buckets we can insert the raw bytes of the
-		// immature outpoint into the preschool bucket.
-		var outpointBytes bytes.Buffer
-		if err := writeOutpoint(&outpointBytes, k.OutPoint()); err != nil {
-			return err
-		}
-		var kidBytes bytes.Buffer
-		if err := k.Encode(&kidBytes); err != nil {
-			return err
-		}
-		err = psclBucket.Put(outpointBytes.Bytes(), kidBytes.Bytes())
-		if err != nil {
-			return err
-		}
+		womb.SetConfHeight(txConfirmation.BlockHeight)
 
-		// Additionally, we'll populate the preschool index so we can
-		// track all the immature outpoints for a particular channel's
-		// chanPoint.
-		var b bytes.Buffer
-		err = writeOutpoint(&b, k.OriginChanPoint())
-		if err != nil {
-			return err
-		}
-		err = psclIndex.Put(b.Bytes(), outpointBytes.Bytes())
-		if err != nil {
-			return err
-		}
+	case <-u.quit:
+		return
+	}
 
-		utxnLog.Infof("Outpoint %v now in preschool, waiting for "+
-			"initial confirmation", k.OutPoint())
+	// TODO(conner): add retry logic?
 
-		return nil
-	})
+	u.mu.Lock()
+	defer u.mu.Unlock()
+
+	err := u.store.BirthToKinder(womb)
+	if err != nil {
+		utxnLog.Errorf("Unable to move htlc output from "+
+			"baby to kindergarten bucket: %v", err)
+	}
+
+	utxnLog.Infof("Htlc output %v promoted to "+
+		"kindergarten", womb.OutPoint())
 }
 
 // waitForPromotion is intended to be run as a goroutine that will wait until a
@@ -561,295 +676,90 @@ func (k *kidOutput) enterPreschool(db *channeldb.DB) error {
 // Notifier), waitForPromotion will delete the output from the "preschool"
 // database bucket and atomically add it to the "kindergarten" database bucket.
 // This is the second step in the output incubation process.
-func (k *kidOutput) waitForPromotion(db *channeldb.DB, confChan *chainntnfs.ConfirmationEvent) {
-	txConfirmation, ok := <-confChan.Confirmed
-	if !ok {
-		utxnLog.Errorf("notification chan "+
-			"closed, can't advance output %v", k.OutPoint())
+func (u *utxoNursery) waitForPromotion(kid *kidOutput,
+	confChan *chainntnfs.ConfirmationEvent) {
+
+	defer u.wg.Done()
+
+	select {
+	case txConfirmation, ok := <-confChan.Confirmed:
+		if !ok {
+			utxnLog.Errorf("Notification chan "+
+				"closed, can't advance output %v",
+				kid.OutPoint())
+			return
+		}
+
+		kid.SetConfHeight(txConfirmation.BlockHeight)
+
+	case <-u.quit:
 		return
 	}
 
-	utxnLog.Infof("Outpoint %v confirmed in block %v moving to kindergarten",
-		k.OutPoint(), txConfirmation.BlockHeight)
+	// TODO(conner): add retry logic?
 
-	k.SetConfHeight(txConfirmation.BlockHeight)
+	u.mu.Lock()
+	defer u.mu.Unlock()
 
-	// The following block deletes a kidOutput from the preschool database
-	// bucket and adds it to the kindergarten database bucket which is
-	// keyed by block height. Keys and values are serialized into byte
-	// array form prior to database insertion.
-	err := db.Update(func(tx *bolt.Tx) error {
-		var originPoint bytes.Buffer
-		if err := writeOutpoint(&originPoint, k.OriginChanPoint()); err != nil {
-			return err
-		}
-
-		psclBucket := tx.Bucket(preschoolBucket)
-		if psclBucket == nil {
-			return errors.New("unable to open preschool bucket")
-		}
-		psclIndex := tx.Bucket(preschoolIndex)
-		if psclIndex == nil {
-			return errors.New("unable to open preschool index")
-		}
-
-		// Now that the entry has been confirmed, in order to move it
-		// along in the maturity pipeline we first delete the entry
-		// from the preschool bucket, as well as the secondary index.
-		var outpointBytes bytes.Buffer
-		if err := writeOutpoint(&outpointBytes, k.OutPoint()); err != nil {
-			return err
-		}
-		if err := psclBucket.Delete(outpointBytes.Bytes()); err != nil {
-			utxnLog.Errorf("unable to delete kindergarten output from "+
-				"preschool bucket: %v", k.OutPoint())
-			return err
-		}
-		if err := psclIndex.Delete(originPoint.Bytes()); err != nil {
-			utxnLog.Errorf("unable to delete kindergarten output from "+
-				"preschool index: %v", k.OutPoint())
-			return err
-		}
-
-		// Next, fetch the kindergarten bucket. This output will remain
-		// in this bucket until it's fully mature.
-		kgtnBucket, err := tx.CreateBucketIfNotExists(kindergartenBucket)
-		if err != nil {
-			return err
-		}
-
-		maturityHeight := k.ConfHeight() + k.BlocksToMaturity()
-
-		heightBytes := make([]byte, 4)
-		byteOrder.PutUint32(heightBytes, maturityHeight)
-
-		// If there're any existing outputs for this particular block
-		// height target, then we'll append this new output to the
-		// serialized list of outputs.
-		var existingOutputs []byte
-		if results := kgtnBucket.Get(heightBytes); results != nil {
-			existingOutputs = results
-		}
-
-		// We'll grab the output's offset in the value for its maturity
-		// height so we can add this to the contract index.
-		outputOffset := len(existingOutputs)
-
-		b := bytes.NewBuffer(existingOutputs)
-		if err := k.Encode(b); err != nil {
-			return err
-		}
-		if err := kgtnBucket.Put(heightBytes, b.Bytes()); err != nil {
-			return err
-		}
-
-		// Finally, we'll insert a new entry into the contract index.
-		// The entry itself consists of 4 bytes for the height, and 4
-		// bytes for the offset within the value for the height.
-		var indexEntry [4 + 4]byte
-		copy(indexEntry[:4], heightBytes)
-		byteOrder.PutUint32(indexEntry[4:], uint32(outputOffset))
-
-		indexBucket, err := tx.CreateBucketIfNotExists(contractIndex)
-		if err != nil {
-			return err
-		}
-		err = indexBucket.Put(originPoint.Bytes(), indexEntry[:])
-		if err != nil {
-			return err
-		}
-
-		utxnLog.Infof("Outpoint %v now in kindergarten, will mature "+
-			"at height %v (delay of %v)", k.OutPoint(),
-			maturityHeight, k.BlocksToMaturity())
-		return nil
-	})
+	err := u.store.PreschoolToKinder(kid)
 	if err != nil {
-		utxnLog.Errorf("unable to move kid output from preschool bucket "+
-			"to kindergarten bucket: %v", err)
+		utxnLog.Errorf("Unable to move kid output "+
+			"from preschool to kindergarten bucket: %v",
+			err)
+		return
 	}
+
+	utxnLog.Infof("Preschool output %v promoted to "+
+		"kindergarten", kid.OutPoint())
 }
 
-// graduateKindergarten handles the steps invoked with moving funds from a
-// force close commitment transaction into a user's wallet after the output
-// from the commitment transaction has become spendable. graduateKindergarten
-// is called both when a new block notification has been received and also at
-// startup in order to process graduations from blocks missed while the UTXO
-// nursery was offline.
-// TODO(roasbeef): single db transaction for the below
-func (u *utxoNursery) graduateKindergarten(blockHeight uint32) error {
-	// First fetch the set of outputs that we can "graduate" at this
-	// particular block height. We can graduate an output once we've
-	// reached its height maturity.
-	kgtnOutputs, err := fetchGraduatingOutputs(u.db, u.wallet, blockHeight)
-	if err != nil {
-		return err
+func (u *utxoNursery) waitForGraduation(kgtnOutputs []kidOutput,
+	confChan *chainntnfs.ConfirmationEvent) {
+
+	defer u.wg.Done()
+
+	select {
+	case _, ok := <-confChan.Confirmed:
+		if !ok {
+			utxnLog.Errorf("Notification chan closed, can't"+
+				" advance %v graduating outputs", len(kgtnOutputs))
+			return
+		}
+
+	case <-u.quit:
+		return
 	}
 
-	// If we're able to graduate any outputs, then create a single
-	// transaction which sweeps them all into the wallet.
-	if len(kgtnOutputs) > 0 {
-		err := sweepGraduatingOutputs(u.wallet, kgtnOutputs)
-		if err != nil {
-			return err
-		}
+	// TODO(conner): add retry logic?
+
+	u.mu.Lock()
+	defer u.mu.Unlock()
+
+	for i := range kgtnOutputs {
+		kid := &kgtnOutputs[i]
 
 		// Now that the sweeping transaction has been broadcast, for
 		// each of the immature outputs, we'll mark them as being fully
 		// closed within the database.
-		for _, closedChan := range kgtnOutputs {
-			err := u.db.MarkChanFullyClosed(closedChan.OriginChanPoint())
-			if err != nil {
-				return err
-			}
-		}
-	}
-
-	// Using a re-org safety margin of 6-blocks, delete any outputs which
-	// have graduated 6 blocks ago.
-	deleteHeight := blockHeight - 6
-	if err := deleteGraduatedOutputs(u.db, deleteHeight); err != nil {
-		return err
-	}
-
-	// Finally, record the last height at which we graduated outputs so we
-	// can reconcile our state with that of the main-chain during restarts.
-	return putLastHeightGraduated(u.db, blockHeight)
-}
-
-// fetchGraduatingOutputs checks the "kindergarten" database bucket whenever a
-// new block is received in order to determine if commitment transaction
-// outputs have become newly spendable. If fetchGraduatingOutputs finds outputs
-// that are ready for "graduation," it passes them on to be swept.  This is the
-// third step in the output incubation process.
-func fetchGraduatingOutputs(db *channeldb.DB, wallet *lnwallet.LightningWallet,
-	blockHeight uint32) ([]*kidOutput, error) {
-
-	var results []byte
-	if err := db.View(func(tx *bolt.Tx) error {
-		// A new block has just been connected, check to see if we have
-		// any new outputs that can be swept into the wallet.
-		kgtnBucket := tx.Bucket(kindergartenBucket)
-		if kgtnBucket == nil {
-			return nil
-		}
-
-		heightBytes := make([]byte, 4)
-		byteOrder.PutUint32(heightBytes, blockHeight)
-
-		results = kgtnBucket.Get(heightBytes)
-		return nil
-	}); err != nil {
-		return nil, err
-	}
-
-	// If no time-locked outputs can be swept at this point, then we can
-	// exit early.
-	if len(results) == 0 {
-		return nil, nil
-	}
-
-	// Otherwise, we deserialize the list of kid outputs into their full
-	// forms.
-	kgtnOutputs, err := deserializeKidList(bytes.NewReader(results))
-	if err != nil {
-		utxnLog.Errorf("error while deserializing list of kidOutputs: %v", err)
-	}
-
-	// For each of the outputs, we also generate its proper witness
-	// function based on its witness type. This varies if the output is on
-	// our commitment transaction or theirs, and also if it's an HTLC
-	// output or not.
-	for _, kgtnOutput := range kgtnOutputs {
-		kgtnOutput.witnessFunc = kgtnOutput.witnessType.GenWitnessFunc(
-			wallet.Cfg.Signer, kgtnOutput.SignDesc())
-	}
-
-	utxnLog.Infof("New block: height=%v, sweeping %v mature outputs",
-		blockHeight, len(kgtnOutputs))
-
-	return kgtnOutputs, nil
-}
-
-// sweepGraduatingOutputs generates and broadcasts the transaction that
-// transfers control of funds from a channel commitment transaction to the
-// user's wallet.
-func sweepGraduatingOutputs(wallet *lnwallet.LightningWallet, kgtnOutputs []*kidOutput) error {
-	// Create a transaction which sweeps all the newly mature outputs into
-	// a output controlled by the wallet.
-	// TODO(roasbeef): can be more intelligent about buffering outputs to
-	// be more efficient on-chain.
-	sweepTx, err := createSweepTx(wallet, kgtnOutputs)
-	if err != nil {
-		// TODO(roasbeef): retry logic?
-		utxnLog.Errorf("unable to create sweep tx: %v", err)
-		return err
-	}
-
-	utxnLog.Infof("Sweeping %v time-locked outputs "+
-		"with sweep tx (txid=%v): %v", len(kgtnOutputs),
-		sweepTx.TxHash(),
-		newLogClosure(func() string {
-			return spew.Sdump(sweepTx)
-		}))
-
-	// With the sweep transaction fully signed, broadcast the transaction
-	// to the network. Additionally, we can stop tracking these outputs as
-	// they've just been swept.
-	if err := wallet.PublishTransaction(sweepTx); err != nil {
-		utxnLog.Errorf("unable to broadcast sweep tx: %v, %v",
-			err, spew.Sdump(sweepTx))
-		return err
-	}
-
-	return nil
-}
-
-// createSweepTx creates a final sweeping transaction with all witnesses in
-// place for all inputs. The created transaction has a single output sending
-// all the funds back to the source wallet.
-func createSweepTx(wallet *lnwallet.LightningWallet,
-	matureOutputs []*kidOutput) (*wire.MsgTx, error) {
-
-	pkScript, err := newSweepPkScript(wallet)
-	if err != nil {
-		return nil, err
-	}
-
-	var totalSum btcutil.Amount
-	for _, o := range matureOutputs {
-		totalSum += o.Amount()
-	}
-
-	sweepTx := wire.NewMsgTx(2)
-	sweepTx.AddTxOut(&wire.TxOut{
-		PkScript: pkScript,
-		Value:    int64(totalSum - 5000),
-	})
-	for _, utxo := range matureOutputs {
-		sweepTx.AddTxIn(&wire.TxIn{
-			PreviousOutPoint: *utxo.OutPoint(),
-			// TODO(roasbeef): assumes pure block delays
-			Sequence: utxo.BlocksToMaturity(),
-		})
-	}
-
-	// TODO(roasbeef): insert fee calculation
-	//  * remove hardcoded fee above
-
-	// With all the inputs in place, use each output's unique witness
-	// function to generate the final witness required for spending.
-	hashCache := txscript.NewTxSigHashes(sweepTx)
-	for i, txIn := range sweepTx.TxIn {
-		witness, err := matureOutputs[i].witnessFunc(sweepTx, hashCache, i)
+		err := u.db.MarkChanFullyClosed(kid.OriginChanPoint())
 		if err != nil {
-			return nil, err
+			utxnLog.Errorf("Unable to mark channel %v as fully "+
+				"closed: %v", kid.OriginChanPoint(), err)
+			continue
 		}
 
-		txIn.Witness = witness
+		utxnLog.Infof("Successfully marked channel %v as fully closed",
+			kid.OriginChanPoint())
 	}
 
-	return sweepTx, nil
+	if err := u.store.AwardDiplomas(kgtnOutputs); err != nil {
+		utxnLog.Errorf("Unable to award diplomas to %v"+
+			"graduating output %v", len(kgtnOutputs))
+		return
+	}
+
+	utxnLog.Infof("Awarded diplomas to %v graduating outputs",
+		len(kgtnOutputs))
 }
 
 // deleteGraduatedOutputs removes outputs from the kindergarten database bucket
@@ -902,22 +812,6 @@ func deleteGraduatedOutputs(db *channeldb.DB, deleteHeight uint32) error {
 		}
 
 		return nil
-	})
-}
-
-// putLastHeightGraduated persists the most recently processed blockheight
-// to the database. This blockheight is used during restarts to determine if
-// blocks were missed while the UTXO Nursery was offline.
-func putLastHeightGraduated(db *channeldb.DB, blockheight uint32) error {
-	return db.Update(func(tx *bolt.Tx) error {
-		kgtnBucket, err := tx.CreateBucketIfNotExists(kindergartenBucket)
-		if err != nil {
-			return nil
-		}
-
-		heightBytes := make([]byte, 4)
-		byteOrder.PutUint32(heightBytes, blockheight)
-		return kgtnBucket.Put(lastGraduatedHeightKey, heightBytes)
 	})
 }
 
