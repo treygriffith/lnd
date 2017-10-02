@@ -13,13 +13,13 @@ import (
 //            NURSERY OUTPUT STATE TRANSITIONS
 //
 //   ┌ ─ ─ ─ ─ ─ ─ ─ ─ ─┐         ┌ ─ ─ ─ ─ ─ ─ ─ ─ ─┐
-//   | EnterPreschool() │         | CallBabysitter() │
+//   | EnterPreschool() │         |    EnterCrib()   │
 //   └ ─ ─ ─ ─ ─ ─ ─ ─ ─┘         └ ─ ─ ─ ─ ─ ─ ─ ─ ─┘
 //             │                            │
 //             │                            │
 //             ▼                            ▼
 //   ┏━━━━━━━━━━━━━━━━━━┓         ┏━━━━━━━━━━━━━━━━━━┓
-//   ┃ Preschool Bucket ┃         ┃    Baby Bucket   ┃
+//   ┃ Preschool Bucket ┃         ┃    Crib Bucket   ┃
 //   ┗━━━━━━━━━━━━━━━━━━┛         ┗━━━━━━━━━━━━━━━━━━┛
 //             │                            │
 //             │                            |
@@ -37,7 +37,7 @@ import (
 //             │                            │
 //             ▼                            ▼
 //   ┌─ ─ ─ ─ ─ ─ ─ ─ ─ ┐         ┌ ─ ─ ─ ─ ─ ─ ─ ─ ─┐
-//   | PromoteKinder()  |         |  EnrollKinder()  |
+//   | PrsclToKinder()  |         |  CribToKinder()  |
 //   └─ ─ ─ ─ ─ ─ ─ ─ ─ ┘         └ ─ ─ ─ ─ ─ ─ ─ ─ ─┘
 //             │                            │
 //             │                            │
@@ -172,25 +172,21 @@ var (
 // primary components, namely the channel index and the height index.
 type NurseryStore interface {
 	LastFinalizedHeight() (uint32, error)
-	LastAttemptedHeight() (uint32, error)
-	//YoungestHeight() (uint32, error)
-	//OldestHeight() (uint32, error)
 
-	ConceiveOutput(*babyOutput) error
-	FetchBirthingOutputs(height uint32) ([]babyOutput, error)
-	BirthToKinder(*babyOutput) error
+	EnterCrib(*babyOutput) error
+	CribToKinder(*babyOutput) error
 
 	EnterPreschool(*kidOutput) error
-	ForEachPreschool(func(*kidOutput) error) error
-	PreschoolToKinder(*kidOutput) error
+	PrsclToKinder(*kidOutput) error
 
-	FetchGraduatingOutputs(height uint32) ([]kidOutput, error)
 	AwardDiplomas([]kidOutput) error
-
-	BeginCeremony(height uint32) error
-	FinalizeCeremony(height uint32) error
+	FinalizeClass(height uint32) error
 
 	ForChanOutputs(*wire.OutPoint, func([]byte, []byte) error) error
+
+	FetchCribs(height uint32) ([]babyOutput, error)
+	FetchPreschools() ([]kidOutput, error)
+	FetchKindergartens(height uint32) ([]kidOutput, error)
 }
 
 type nurseryStore struct {
@@ -205,7 +201,7 @@ func newNurseryStore(db *channeldb.DB, chainHash *chainhash.Hash) *nurseryStore 
 	}
 }
 
-func (ns *nurseryStore) ConceiveOutput(baby *babyOutput) error {
+func (ns *nurseryStore) EnterCrib(baby *babyOutput) error {
 	return ns.db.Update(func(tx *bolt.Tx) error {
 
 		chanPoint := baby.OriginChanPoint()
@@ -241,171 +237,7 @@ func (ns *nurseryStore) ConceiveOutput(baby *babyOutput) error {
 	})
 }
 
-func (ns *nurseryStore) FetchBirthingOutputs(height uint32) ([]babyOutput, error) {
-	var babies []babyOutput
-	if err := ns.db.View(func(tx *bolt.Tx) error {
-
-		hghtBucket := ns.getHeightBucket(tx, height)
-		if hghtBucket == nil {
-			return nil
-		}
-
-		var channelBuckets [][]byte
-		if err := hghtBucket.ForEach(func(chanBytes, valBytes []byte) error {
-			channelBuckets = append(channelBuckets, chanBytes)
-			return nil
-		}); err != nil {
-			return err
-		}
-
-		chainBucket := tx.Bucket(ns.chainHash[:])
-		if chainBucket == nil {
-			return nil
-		}
-
-		chanIndex := chainBucket.Bucket(channelIndex)
-		if chanIndex == nil {
-			return nil
-		}
-
-		for _, chanBytes := range channelBuckets {
-			hghtChanBucket := hghtBucket.Bucket(chanBytes)
-			if hghtChanBucket == nil {
-				continue
-			}
-
-			chanBucket := chanIndex.Bucket(chanBytes)
-			if chanBucket == nil {
-				continue
-			}
-
-			c := hghtChanBucket.Cursor()
-
-			for k, _ := c.Seek(babyPrefix); k != nil &&
-				bytes.HasPrefix(k, babyPrefix); k, _ = c.Next() {
-
-				pfxOutputKey := k
-
-				babyBytes := chanBucket.Get(pfxOutputKey)
-				if babyBytes == nil {
-					continue
-				}
-
-				var baby babyOutput
-				err := baby.Decode(bytes.NewBuffer(babyBytes))
-				if err != nil {
-					return err
-				}
-
-				babies = append(babies, baby)
-			}
-		}
-
-		return nil
-	}); err != nil {
-		return nil, err
-	}
-
-	return babies, nil
-}
-
-// Graduate persists the most recently processed blockheight to the database.
-// This blockheight is used during restarts to determine if blocks were missed
-// while the UTXO Nursery was offline.
-func (ns *nurseryStore) BeginCeremony(height uint32) error {
-	return ns.db.Update(func(tx *bolt.Tx) error {
-		return ns.putLastAttemptedHeight(tx, height)
-	})
-}
-func (ns *nurseryStore) FinalizeCeremony(height uint32) error {
-	return ns.db.Update(func(tx *bolt.Tx) error {
-		return ns.putLastFinalizedHeight(tx, height)
-	})
-}
-
-func (ns *nurseryStore) LastAttemptedHeight() (uint32, error) {
-	var lastAttemptedHeight uint32
-	err := ns.db.View(func(tx *bolt.Tx) error {
-		lastHeight, err := ns.getLastAttemptedHeight(tx)
-		if err != nil {
-			return err
-		}
-
-		lastAttemptedHeight = lastHeight
-
-		return nil
-	})
-	return lastAttemptedHeight, err
-}
-
-func (ns *nurseryStore) getLastAttemptedHeight(tx *bolt.Tx) (uint32, error) {
-	chainBucket := tx.Bucket(ns.chainHash[:])
-	if chainBucket == nil {
-		return 0, nil
-	}
-
-	heightBytes := chainBucket.Get(lastAttemptedHeightKey)
-	if len(heightBytes) != 4 {
-		return 0, nil
-	}
-
-	return byteOrder.Uint32(heightBytes), nil
-}
-
-func (ns *nurseryStore) putLastAttemptedHeight(tx *bolt.Tx, height uint32) error {
-	chainBucket, err := tx.CreateBucketIfNotExists(ns.chainHash[:])
-	if err != nil {
-		return err
-	}
-
-	var lastHeightBytes [4]byte
-	byteOrder.PutUint32(lastHeightBytes[:], height)
-
-	return chainBucket.Put(lastAttemptedHeightKey, lastHeightBytes[:])
-}
-
-func (ns *nurseryStore) LastFinalizedHeight() (uint32, error) {
-	var lastFinalizedHeight uint32
-	err := ns.db.View(func(tx *bolt.Tx) error {
-		lastHeight, err := ns.getLastFinalizedHeight(tx)
-		if err != nil {
-			return err
-		}
-
-		lastFinalizedHeight = lastHeight
-
-		return nil
-	})
-	return lastFinalizedHeight, err
-}
-
-func (ns *nurseryStore) getLastFinalizedHeight(tx *bolt.Tx) (uint32, error) {
-	chainBucket := tx.Bucket(ns.chainHash[:])
-	if chainBucket == nil {
-		return 0, nil
-	}
-
-	heightBytes := chainBucket.Get(lastFinalizedHeightKey)
-	if len(heightBytes) != 4 {
-		return 0, nil
-	}
-
-	return byteOrder.Uint32(heightBytes), nil
-}
-
-func (ns *nurseryStore) putLastFinalizedHeight(tx *bolt.Tx, height uint32) error {
-	chainBucket, err := tx.CreateBucketIfNotExists(ns.chainHash[:])
-	if err != nil {
-		return err
-	}
-
-	var lastHeightBytes [4]byte
-	byteOrder.PutUint32(lastHeightBytes[:], height)
-
-	return chainBucket.Put(lastFinalizedHeightKey, lastHeightBytes[:])
-}
-
-func (ns *nurseryStore) BirthToKinder(baby *babyOutput) error {
+func (ns *nurseryStore) CribToKinder(baby *babyOutput) error {
 	return ns.db.Update(func(tx *bolt.Tx) error {
 
 		chanPoint := baby.OriginChanPoint()
@@ -541,12 +373,191 @@ func (ns *nurseryStore) PreschoolToKinder(kid *kidOutput) error {
 	})
 }
 
+func (ns *nurseryStore) FinalizeClass(height uint32) error {
+	return ns.db.Update(func(tx *bolt.Tx) error {
+		return ns.putLastFinalizedHeight(tx, height)
+	})
+}
+
+func (ns *nurseryStore) LastFinalizedHeight() (uint32, error) {
+	var lastFinalizedHeight uint32
+	err := ns.db.View(func(tx *bolt.Tx) error {
+		lastHeight, err := ns.getLastFinalizedHeight(tx)
+		if err != nil {
+			return err
+		}
+
+		lastFinalizedHeight = lastHeight
+
+		return nil
+	})
+	return lastFinalizedHeight, err
+}
+
+func (ns *nurseryStore) getLastFinalizedHeight(tx *bolt.Tx) (uint32, error) {
+	chainBucket := tx.Bucket(ns.chainHash[:])
+	if chainBucket == nil {
+		return 0, nil
+	}
+
+	heightBytes := chainBucket.Get(lastFinalizedHeightKey)
+	if len(heightBytes) != 4 {
+		return 0, nil
+	}
+
+	return byteOrder.Uint32(heightBytes), nil
+}
+
+func (ns *nurseryStore) putLastFinalizedHeight(tx *bolt.Tx, height uint32) error {
+	chainBucket, err := tx.CreateBucketIfNotExists(ns.chainHash[:])
+	if err != nil {
+		return err
+	}
+
+	var lastHeightBytes [4]byte
+	byteOrder.PutUint32(lastHeightBytes[:], height)
+
+	return chainBucket.Put(lastFinalizedHeightKey, lastHeightBytes[:])
+}
+
+func (ns *nurseryStore) ForChanOutputs(chanPoint *wire.OutPoint,
+	cb func([]byte, []byte) error) error {
+
+	return ns.db.View(func(tx *bolt.Tx) error {
+		chanBucket := ns.getChannelBucket(tx, chanPoint)
+		if chanBucket == nil {
+			return ErrContractNotFound
+		}
+
+		return chanBucket.ForEach(cb)
+	})
+}
+
+func (ns *nurseryStore) FetchPreschools() ([]kidOutput, error) {
+	var kids []kidOutput
+	if err := ns.db.View(func(tx *bolt.Tx) error {
+		chainBucket := tx.Bucket(ns.chainHash[:])
+		if chainBucket == nil {
+			return nil
+		}
+
+		chanIndex := chainBucket.Bucket(channelIndex)
+		if chanIndex == nil {
+			return nil
+		}
+
+		var channelBuckets [][]byte
+		if err := chanIndex.ForEach(func(chanBytes, valBytes []byte) error {
+			channelBuckets = append(channelBuckets, chanBytes)
+			return nil
+		}); err != nil {
+			return err
+		}
+
+		for _, chanBytes := range channelBuckets {
+			chanBucket := chanIndex.Bucket(chanBytes)
+			if chanBucket == nil {
+				continue
+			}
+
+			c := chanBucket.Cursor()
+
+			for k, v := c.Seek(psclPrefix); k != nil &&
+				bytes.HasPrefix(k, psclPrefix); k, v = c.Next() {
+
+				var psclOutput kidOutput
+				psclReader := bytes.NewReader(v)
+				err := psclOutput.Decode(psclReader)
+				if err != nil {
+					return err
+				}
+
+				kids = append(kids, psclOutput)
+			}
+		}
+
+		return nil
+	}); err != nil {
+		return nil, err
+	}
+
+	return kids, nil
+}
+
+func (ns *nurseryStore) FetchCribs(height uint32) ([]babyOutput, error) {
+	var babies []babyOutput
+	if err := ns.db.View(func(tx *bolt.Tx) error {
+
+		hghtBucket := ns.getHeightBucket(tx, height)
+		if hghtBucket == nil {
+			return nil
+		}
+
+		var channelBuckets [][]byte
+		if err := hghtBucket.ForEach(func(chanBytes, valBytes []byte) error {
+			channelBuckets = append(channelBuckets, chanBytes)
+			return nil
+		}); err != nil {
+			return err
+		}
+
+		chainBucket := tx.Bucket(ns.chainHash[:])
+		if chainBucket == nil {
+			return nil
+		}
+
+		chanIndex := chainBucket.Bucket(channelIndex)
+		if chanIndex == nil {
+			return nil
+		}
+
+		for _, chanBytes := range channelBuckets {
+			hghtChanBucket := hghtBucket.Bucket(chanBytes)
+			if hghtChanBucket == nil {
+				continue
+			}
+
+			chanBucket := chanIndex.Bucket(chanBytes)
+			if chanBucket == nil {
+				continue
+			}
+
+			c := hghtChanBucket.Cursor()
+
+			for k, _ := c.Seek(babyPrefix); k != nil &&
+				bytes.HasPrefix(k, babyPrefix); k, _ = c.Next() {
+
+				pfxOutputKey := k
+
+				babyBytes := chanBucket.Get(pfxOutputKey)
+				if babyBytes == nil {
+					continue
+				}
+
+				var baby babyOutput
+				err := baby.Decode(bytes.NewBuffer(babyBytes))
+				if err != nil {
+					return err
+				}
+
+				babies = append(babies, baby)
+			}
+		}
+
+		return nil
+	}); err != nil {
+		return nil, err
+	}
+
+	return babies, nil
+}
+
 // FetchGraduatingOutputs checks the "kindergarten" database bucket whenever a
 // new block is received in order to determine if commitment transaction
 // outputs have become newly spendable. If fetchGraduatingOutputs finds outputs
 // that are ready for "graduation," it passes them on to be swept.  This is the
 // third step in the output incubation process.
-func (ns *nurseryStore) FetchGraduatingOutputs(height uint32) ([]kidOutput, error) {
+func (ns *nurseryStore) FetchKindergartens(height uint32) ([]kidOutput, error) {
 	var kids []kidOutput
 	if err := ns.db.View(func(tx *bolt.Tx) error {
 
@@ -632,67 +643,6 @@ func (ns *nurseryStore) AwardDiplomas(kids []kidOutput) error {
 				continue
 			default:
 				return err
-			}
-		}
-
-		return nil
-	})
-}
-
-func (ns *nurseryStore) ForChanOutputs(chanPoint *wire.OutPoint,
-	cb func([]byte, []byte) error) error {
-
-	return ns.db.View(func(tx *bolt.Tx) error {
-		chanBucket := ns.getChannelBucket(tx, chanPoint)
-		if chanBucket == nil {
-			return ErrContractNotFound
-		}
-
-		return chanBucket.ForEach(cb)
-	})
-}
-
-func (ns *nurseryStore) ForEachPreschool(cb func(kid *kidOutput) error) error {
-	return ns.db.View(func(tx *bolt.Tx) error {
-		chainBucket := tx.Bucket(ns.chainHash[:])
-		if chainBucket == nil {
-			return nil
-		}
-
-		chanIndex := chainBucket.Bucket(channelIndex)
-		if chanIndex == nil {
-			return nil
-		}
-
-		var channelBuckets [][]byte
-		if err := chanIndex.ForEach(func(chanBytes, valBytes []byte) error {
-			channelBuckets = append(channelBuckets, chanBytes)
-			return nil
-		}); err != nil {
-			return err
-		}
-
-		for _, chanBytes := range channelBuckets {
-			chanBucket := chanIndex.Bucket(chanBytes)
-			if chanBucket == nil {
-				continue
-			}
-
-			c := chanBucket.Cursor()
-
-			for k, v := c.Seek(psclPrefix); k != nil &&
-				bytes.HasPrefix(k, psclPrefix); k, v = c.Next() {
-
-				var psclOutput kidOutput
-				psclReader := bytes.NewReader(v)
-				err := psclOutput.Decode(psclReader)
-				if err != nil {
-					return err
-				}
-
-				if err := cb(&psclOutput); err != nil {
-					return err
-				}
 			}
 		}
 
