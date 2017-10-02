@@ -177,7 +177,7 @@ type NurseryStore interface {
 	CribToKinder(*babyOutput) error
 
 	EnterPreschool(*kidOutput) error
-	PrsclToKinder(*kidOutput) error
+	PreschoolToKinder(*kidOutput) error
 
 	AwardDiplomas([]kidOutput) error
 	FinalizeClass(height uint32) error
