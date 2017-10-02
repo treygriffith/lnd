@@ -348,7 +348,7 @@ func (u *utxoNursery) graduateKindergarten(blockHeight uint32) error {
 
 	}
 
-	return nil
+	return u.store.FinalizeClass(blockHeight - 100)
 }
 
 // sweepGraduatingOutputs generates and broadcasts the transaction that
@@ -787,27 +787,26 @@ func (u *utxoNursery) waitForGraduation(kgtnOutputs []kidOutput,
 	u.mu.Lock()
 	defer u.mu.Unlock()
 
-	for i := range kgtnOutputs {
-		kid := &kgtnOutputs[i]
-
-		// Now that the sweeping transaction has been broadcast, for
-		// each of the immature outputs, we'll mark them as being fully
-		// closed within the database.
-		err := u.db.MarkChanFullyClosed(kid.OriginChanPoint())
-		if err != nil {
-			utxnLog.Errorf("Unable to mark channel %v as fully "+
-				"closed: %v", kid.OriginChanPoint(), err)
-			continue
-		}
-
-		utxnLog.Infof("Successfully marked channel %v as fully closed",
-			kid.OriginChanPoint())
-	}
-
-	if err := u.store.AwardDiplomas(kgtnOutputs); err != nil {
+	channelsToClose, err := u.store.AwardDiplomas(kgtnOutputs)
+	if err != nil {
 		utxnLog.Errorf("Unable to award diplomas to %v"+
 			"graduating output %v", len(kgtnOutputs))
 		return
+	}
+
+	for _, chanPoint := range channelsToClose {
+		// Now that the sweeping transaction has been broadcast, for
+		// each of the immature outputs, we'll mark them as being fully
+		// closed within the database.
+		err := u.db.MarkChanFullyClosed(&chanPoint)
+		if err != nil {
+			utxnLog.Errorf("Unable to mark channel %v as fully "+
+				"closed: %v", chanPoint, err)
+			continue
+		}
+
+		utxnLog.Infof("Successfully marked channel %v as fully closed", chanPoint)
+
 	}
 
 	utxnLog.Infof("Awarded diplomas to %v graduating outputs",
