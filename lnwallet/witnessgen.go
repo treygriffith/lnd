@@ -33,6 +33,10 @@ const (
 	// HtlcAcceptedRevoke is a witness that allows us to sweep an HTLC
 	// output that we accepted from the counterparty.
 	HtlcAcceptedRevoke WitnessType = 4
+
+	// HtlcTimeLock is a witness that allows us to sweep an offered HTLC
+	// after entering the delay+claim stage.
+	HtlcOfferedTimeLock WitnessType = 5
 )
 
 // WitnessGenerator represents a function which is able to generate the final
@@ -64,6 +68,8 @@ func (wt WitnessType) GenWitnessFunc(signer Signer,
 			return ReceiverHtlcSpendRevoke(signer, desc, tx)
 		case HtlcAcceptedRevoke:
 			return SenderHtlcSpendRevoke(signer, desc, tx)
+		case HtlcOfferedTimeLock:
+			return HtlcSpendSuccess(signer, desc, tx)
 		default:
 			return nil, fmt.Errorf("unknown witness type: %v", wt)
 		}
