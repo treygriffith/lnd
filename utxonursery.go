@@ -128,7 +128,7 @@ func (u *utxoNursery) Start() error {
 	// this to strict the search space when asking for confirmation
 	// notifications, and also to scan the chain to graduate now mature
 	// outputs.
-	lastGraduatedHeight, err := u.store.LastAttemptedHeight()
+	lastGraduatedHeight, err := u.store.LastFinalizedHeight()
 	if err != nil {
 		return err
 	}
@@ -173,7 +173,12 @@ func (u *utxoNursery) Stop() error {
 // reloadPreschool re-initializes the chain notifier with all of the outputs
 // that had been saved to the "preschool" database bucket prior to shutdown.
 func (u *utxoNursery) reloadPreschool(heightHint uint32) error {
-	return u.store.ForEachPreschool(func(kid *kidOutput) error {
+	psclOutputs, err := u.store.FetchPreschools()
+	if err != nil {
+		return err
+	}
+
+	for i, kid := range psclOutputs {
 		txID := kid.OutPoint().Hash
 
 		confChan, err := u.notifier.RegisterConfirmationsNtfn(
@@ -186,10 +191,10 @@ func (u *utxoNursery) reloadPreschool(heightHint uint32) error {
 			"notification.", kid.OutPoint())
 
 		u.wg.Add(1)
-		go u.waitForPromotion(kid, confChan)
+		go u.waitForPromotion(&psclOutputs[i], confChan)
+	}
 
-		return nil
-	})
+	return nil
 }
 
 // catchUpKindergarten handles the graduation of kindergarten outputs from
@@ -237,18 +242,10 @@ func (u *utxoNursery) catchUpKindergarten(lastGraduatedHeight uint32) error {
 // TODO(roasbeef): single db transaction for the below
 func (u *utxoNursery) graduateKindergarten(blockHeight uint32) error {
 
-	// Immediately mark that we are attempting to process this block height.
-	// During restarts, this will allow the utxo nursery to re-initialize
-	// any tasks that are required to completely finish processing the
-	// outputs at this height.
-	if err := u.store.BeginCeremony(blockHeight); err != nil {
-		return err
-	}
-
 	// First fetch the set of outputs that we can "graduate" at this
 	// particular block height. We can graduate an output once we've
 	// reached its height maturity.
-	kgtnOutputs, err := u.store.FetchGraduatingOutputs(blockHeight)
+	kgtnOutputs, err := u.store.FetchKindergartens(blockHeight)
 	if err != nil {
 		return err
 	}
@@ -262,18 +259,18 @@ func (u *utxoNursery) graduateKindergarten(blockHeight uint32) error {
 		}
 	}
 
-	wombOutputs, err := u.store.FetchBirthingOutputs(blockHeight)
+	babyOutputs, err := u.store.FetchCribs(blockHeight)
 	if err != nil {
 		return err
 	}
 
-	for i := range wombOutputs {
-		output := &wombOutputs[i]
+	for i := range babyOutputs {
+		output := &babyOutputs[i]
 
 		// Broadcast transaction, canceling notification if we fail
 		err = u.wallet.PublishTransaction(output.timeoutTx)
 		if err != nil {
-			utxnLog.Errorf("unable to broadcast womb tx: "+
+			utxnLog.Errorf("Unable to broadcast baby tx: "+
 				"%v, %v", err,
 				spew.Sdump(output.timeoutTx))
 			return err
@@ -281,7 +278,7 @@ func (u *utxoNursery) graduateKindergarten(blockHeight uint32) error {
 
 		birthTxID := output.OutPoint().Hash
 
-		// Register for the confirmation of womb tx
+		// Register for the confirmation of baby tx
 		confChan, err := u.notifier.RegisterConfirmationsNtfn(
 			&birthTxID, 1, blockHeight,
 		)
@@ -289,11 +286,11 @@ func (u *utxoNursery) graduateKindergarten(blockHeight uint32) error {
 			return err
 		}
 
-		utxnLog.Infof("Womb output %v registered for promotion "+
+		utxnLog.Infof("Baby output %v registered for promotion "+
 			"notification.", output.OutPoint())
 
 		u.wg.Add(1)
-		go u.waitForBirth(output, confChan)
+		go u.waitForEnrollment(output, confChan)
 
 	}
 
@@ -308,7 +305,7 @@ func (u *utxoNursery) sweepGraduatingOutputs(kgtnOutputs []kidOutput) error {
 	// a output controlled by the wallet.
 	// TODO(roasbeef): can be more intelligent about buffering outputs to
 	// be more efficient on-chain.
-	inputs := make([]TLockSpendableOutput, 0, len(kgtnOutputs))
+	inputs := make([]CsvSpendableOutput, 0, len(kgtnOutputs))
 	for i := range kgtnOutputs {
 		inputs = append(inputs, &kgtnOutputs[i])
 	}
@@ -356,7 +353,7 @@ func (u *utxoNursery) sweepGraduatingOutputs(kgtnOutputs []kidOutput) error {
 // place for all inputs. The created transaction has a single output sending
 // all the funds back to the source wallet.
 func (u *utxoNursery) createSweepTx(
-	inputs []TLockSpendableOutput) (*wire.MsgTx, error) {
+	inputs []CsvSpendableOutput) (*wire.MsgTx, error) {
 
 	pkScript, err := newSweepPkScript(u.wallet)
 	if err != nil {
@@ -396,7 +393,7 @@ func (u *utxoNursery) createSweepTx(
 	// With all the inputs in place, use each output's unique witness
 	// function to generate the final witness required for spending.
 
-	addWitness := func(idx int, tso TLockSpendableOutput) error {
+	addWitness := func(idx int, tso CsvSpendableOutput) error {
 		witness, err := tso.BuildWitness(u.wallet.Cfg.Signer, sweepTx,
 			hashCache, idx)
 		if err != nil {
@@ -440,7 +437,7 @@ func (u *utxoNursery) IncubateOutputs(closeSummary *lnwallet.ForceCloseSummary) 
 		// don't have a settled balance within the commitment
 		// transaction.
 		if selfOutput.Amount() == 0 {
-			goto wombOutputs
+			goto babyOutputs
 		}
 
 		sourceTxid := selfOutput.OutPoint().Hash
@@ -449,7 +446,7 @@ func (u *utxoNursery) IncubateOutputs(closeSummary *lnwallet.ForceCloseSummary) 
 		if err != nil {
 			utxnLog.Errorf("unable to add kidOutput "+
 				"to new preschool: %v, %v", selfOutput, err)
-			goto wombOutputs
+			goto babyOutputs
 		}
 
 		// Register for a notification that will trigger graduation from
@@ -460,7 +457,7 @@ func (u *utxoNursery) IncubateOutputs(closeSummary *lnwallet.ForceCloseSummary) 
 		if err != nil {
 			utxnLog.Errorf("unable to register output for "+
 				"confirmation: %v", sourceTxid)
-			goto wombOutputs
+			goto babyOutputs
 		}
 
 		utxnLog.Infof("Added kid output to pscl: %v",
@@ -473,7 +470,7 @@ func (u *utxoNursery) IncubateOutputs(closeSummary *lnwallet.ForceCloseSummary) 
 		go u.waitForPromotion(&selfOutput, confChan)
 	}
 
-wombOutputs:
+babyOutputs:
 	for i := range closeSummary.HtlcResolutions {
 		htlcRes := closeSummary.HtlcResolutions[i]
 
@@ -485,7 +482,7 @@ wombOutputs:
 		utxnLog.Infof("htlc resolution with expiry: %v",
 			htlcRes.Expiry)
 
-		htlcOutput := makeWombOutput(
+		htlcOutput := makeBabyOutput(
 			htlcOutpoint,
 			&closeSummary.ChanPoint,
 			closeSummary.SelfOutputMaturity,
@@ -497,12 +494,12 @@ wombOutputs:
 			continue
 		}
 
-		err := u.store.ConceiveOutput(&htlcOutput)
+		err := u.store.EnterCrib(&htlcOutput)
 		if err != nil {
 			continue
 		}
 
-		utxnLog.Infof("Added htlc output to womb: %v",
+		utxnLog.Infof("Added htlc output to baby: %v",
 			htlcOutput.OutPoint())
 	}
 }
@@ -623,7 +620,7 @@ func (u *utxoNursery) NurseryReport(
 				report.maturityHeight = (kid.BlocksToMaturity() +
 					kid.ConfHeight())
 			}
-		case string(wombPrefix):
+		case string(babyPrefix):
 		default:
 		}
 
@@ -635,7 +632,7 @@ func (u *utxoNursery) NurseryReport(
 	return report, nil
 }
 
-func (u *utxoNursery) waitForBirth(womb *wombOutput,
+func (u *utxoNursery) waitForEnrollment(baby *babyOutput,
 	confChan *chainntnfs.ConfirmationEvent) {
 
 	defer u.wg.Done()
@@ -644,12 +641,12 @@ func (u *utxoNursery) waitForBirth(womb *wombOutput,
 	case txConfirmation, ok := <-confChan.Confirmed:
 		if !ok {
 			utxnLog.Errorf("Notification chan "+
-				"closed, can't advance womb output %v",
-				womb.OutPoint())
+				"closed, can't advance baby output %v",
+				baby.OutPoint())
 			return
 		}
 
-		womb.SetConfHeight(txConfirmation.BlockHeight)
+		baby.SetConfHeight(txConfirmation.BlockHeight)
 
 	case <-u.quit:
 		return
@@ -660,14 +657,15 @@ func (u *utxoNursery) waitForBirth(womb *wombOutput,
 	u.mu.Lock()
 	defer u.mu.Unlock()
 
-	err := u.store.BirthToKinder(womb)
+	err := u.store.CribToKinder(baby)
 	if err != nil {
 		utxnLog.Errorf("Unable to move htlc output from "+
-			"baby to kindergarten bucket: %v", err)
+			"crib to kindergarten bucket: %v", err)
+		return
 	}
 
 	utxnLog.Infof("Htlc output %v promoted to "+
-		"kindergarten", womb.OutPoint())
+		"kindergarten", baby.OutPoint())
 }
 
 // waitForPromotion is intended to be run as a goroutine that will wait until a
