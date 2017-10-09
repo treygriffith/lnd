@@ -289,28 +289,6 @@ func init() {
 	}
 }
 
-func TestDeserializeKidsList(t *testing.T) {
-	var b bytes.Buffer
-	for _, kid := range kidOutputs {
-		if err := kid.Encode(&b); err != nil {
-			t.Fatalf("unable to serialize and add kid output to "+
-				"list: %v", err)
-		}
-	}
-
-	kidList, err := deserializeKidList(&b)
-	if err != nil {
-		t.Fatalf("unable to deserialize kid output list: %v", err)
-	}
-
-	for i := range kidOutputs {
-		if !reflect.DeepEqual(&kidOutputs[i], kidList[i]) {
-			t.Fatalf("kidOutputs don't match \n%+v\n%+v",
-				&kidOutputs[i], kidList[i])
-		}
-	}
-}
-
 func TestKidOutputSerialization(t *testing.T) {
 	for i, kid := range kidOutputs {
 		var b bytes.Buffer
