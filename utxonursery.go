@@ -201,7 +201,7 @@ func (u *utxoNursery) Start() error {
 	// this to restrict the search space when asking for confirmation
 	// notifications, and also to scan the chain to graduate now mature
 	// outputs.
-	lastGraduatedHeight, err := u.cfg.Store.LastFinalizedHeight()
+	lastPrunedHeight, err := u.cfg.Store.LastPurgedHeight()
 	if err != nil {
 		return err
 	}
@@ -210,7 +210,7 @@ func (u *utxoNursery) Start() error {
 	// NOTE: These next step *may* spawn go routines, thus from this point
 	// forward, we must close the nursery's quit channel if we detect a
 	// failure to ensure they terminate.
-	if err := u.reloadPreschool(lastGraduatedHeight); err != nil {
+	if err := u.reloadPreschool(lastPrunedHeight); err != nil {
 		close(u.quit)
 		return err
 	}
@@ -218,8 +218,7 @@ func (u *utxoNursery) Start() error {
 	// 3. Replay all crib and kindergarten outputs from last finalized to
 	// current best height.
 
-	u.currentHeight = lastGraduatedHeight
-	if err := u.reloadClasses(lastGraduatedHeight); err != nil {
+	if err := u.reloadClasses(lastPrunedHeight); err != nil {
 		close(u.quit)
 		return err
 	}
@@ -236,8 +235,13 @@ func (u *utxoNursery) Start() error {
 		return err
 	}
 
+	lastFinalizedHeight, err := u.cfg.Store.LastFinalizedHeight()
+	if err != nil {
+		return err
+	}
+
 	u.wg.Add(1)
-	go u.incubator(newBlockChan, lastGraduatedHeight)
+	go u.incubator(newBlockChan, lastFinalizedHeight)
 
 	return nil
 }
@@ -289,7 +293,7 @@ func (u *utxoNursery) reloadPreschool(heightHint uint32) error {
 // reinitialize all state to continue sweeping outputs, even in the event that
 // we missed blocks while offline. reloadClasses is called during the startup of
 // the UTXO Nursery.
-func (u *utxoNursery) reloadClasses(lastGraduatedHeight uint32) error {
+func (u *utxoNursery) reloadClasses(lastPrunedHeight uint32) error {
 	// Get the most recently mined block.
 	_, bestHeight, err := u.cfg.ChainIO.GetBestBlock()
 	if err != nil {
@@ -298,26 +302,28 @@ func (u *utxoNursery) reloadClasses(lastGraduatedHeight uint32) error {
 
 	// If we haven't yet seen any registered force closes, or we're already
 	// caught up with the current best chain, then we can exit early.
-	if lastGraduatedHeight == 0 || uint32(bestHeight) == lastGraduatedHeight {
+	if lastPrunedHeight == 0 || uint32(bestHeight) == lastPrunedHeight {
 		return nil
 	}
 
 	utxnLog.Infof("Processing outputs from missed blocks. Starting with "+
-		"blockHeight: %v, to current blockHeight: %v", lastGraduatedHeight,
+		"blockHeight: %v, to current blockHeight: %v", lastPrunedHeight,
 		bestHeight)
 
 	// Loop through and check for graduating outputs at each of the missed
 	// block heights.
-	for graduationHeight := lastGraduatedHeight + 1; graduationHeight <= uint32(bestHeight); graduationHeight++ {
+	for curHeight := lastPrunedHeight + 1; curHeight <= uint32(bestHeight); curHeight++ {
 		// Each attempt at graduation is protected by a lock, since
 		// there may be background processes attempting to modify the
 		// database concurrently.
 		u.mu.Lock()
-		if err := u.graduateClass(graduationHeight); err != nil {
+		if err := u.graduateClass(curHeight); err != nil {
 			u.mu.Unlock()
 			utxnLog.Errorf("Failed to graduate outputs at height=%v: %v",
-				graduationHeight, err)
+				curHeight, err)
 			return err
+		} else {
+			utxnLog.Infof("Regraduated outputs at height=%v", curHeight)
 		}
 		u.mu.Unlock()
 	}
@@ -336,21 +342,55 @@ func (u *utxoNursery) graduateClass(classHeight uint32) error {
 	// Record this height as the nursery's current best height.
 	u.currentHeight = classHeight
 
-	// First fetch the set of outputs that we can "graduate" at this
-	// particular block height. We can graduate an output once we've
-	// reached its height maturity.
-	kgtnOutputs, cribOutputs, err := u.cfg.Store.FetchClass(classHeight)
+	lastFinalizedHeight, err := u.cfg.Store.LastFinalizedHeight()
 	if err != nil {
 		return err
 	}
 
-	// If we're able to graduate any outputs, then create a single
-	// transaction which sweeps them all into the wallet.
-	if len(kgtnOutputs) > 0 {
-		err := u.sweepGraduatingOutputs(classHeight, kgtnOutputs)
+	// First fetch the set of outputs that we can "graduate" at this
+	// particular block height. We can graduate an output once we've
+	// reached its height maturity.
+	finalTx, kgtnOutputs, cribOutputs, err := u.cfg.Store.FetchClass(
+		classHeight)
+	if err != nil {
+		return err
+	}
+
+	if classHeight > lastFinalizedHeight {
+		if len(kgtnOutputs) > 0 {
+			finalTx, err = u.createSweepTx(kgtnOutputs)
+			if err != nil {
+				return err
+			}
+		}
+
+		err = u.cfg.Store.FinalizeKinder(classHeight, finalTx)
+		if err != nil {
+			utxnLog.Errorf("Failed to finalize height %d",
+				classHeight)
+
+			return err
+		}
+
+		utxnLog.Infof("Successfully finalized height %d ",
+			classHeight)
+	}
+
+	if finalTx != nil {
+		utxnLog.Infof("Sweeping %v time-locked outputs "+
+			"with sweep tx (txid=%v): %v", len(kgtnOutputs),
+			finalTx.TxHash(),
+			newLogClosure(func() string {
+				return spew.Sdump(finalTx)
+			}))
+
+		err := u.sweepGraduatingKinders(classHeight, finalTx,
+			kgtnOutputs)
 		if err != nil {
 			return err
 		}
+	} else {
+		utxnLog.Infof("No finalized txn at height %d", classHeight)
 	}
 
 	for i := range cribOutputs {
@@ -390,21 +430,18 @@ func (u *utxoNursery) graduateClass(classHeight uint32) error {
 	}
 
 	// Finalize and purge all state below the threshold height.
-	heightToFinalize := classHeight - u.cfg.PruningDepth
-	if err := u.cfg.Store.FinalizeHeight(heightToFinalize); err != nil {
-		utxnLog.Errorf("Failed to finalize height %d", heightToFinalize)
+	heightToPurge := classHeight - u.cfg.PruningDepth
+	if err := u.cfg.Store.PurgeHeight(heightToPurge); err != nil {
+		utxnLog.Errorf("Failed to purge height %d", heightToPurge)
 		return err
 	}
 
-	utxnLog.Infof("Successfully finalized height %d ", heightToFinalize)
+	utxnLog.Infof("Successfully purged height %d ", heightToPurge)
 
 	return nil
 }
 
-// sweepGraduatingOutputs generates and broadcasts the transaction that
-// transfers control of funds from a channel commitment transaction to the
-// user's wallet.
-func (u *utxoNursery) sweepGraduatingOutputs(classHeight uint32, kgtnOutputs []kidOutput) error {
+func (u *utxoNursery) createSweepTx(kgtnOutputs []kidOutput) (*wire.MsgTx, error) {
 	// Create a transaction which sweeps all the newly mature outputs into
 	// a output controlled by the wallet.
 	// TODO(roasbeef): car be more intelligent about buffering outputs to
@@ -441,54 +478,14 @@ func (u *utxoNursery) sweepGraduatingOutputs(classHeight uint32, kgtnOutputs []k
 		inputs = append(inputs, input)
 	}
 
-	sweepTx, err := u.createSweepTx(txWeight, inputs)
-	if err != nil {
-		// TODO(roasbeef): retry logic?
-		utxnLog.Errorf("unable to create sweep tx: %v", err)
-		return nil
-	}
-
-	utxnLog.Infof("Sweeping %v time-locked outputs "+
-		"with sweep tx (txid=%v): %v", len(kgtnOutputs),
-		sweepTx.TxHash(),
-		newLogClosure(func() string {
-			return spew.Sdump(sweepTx)
-		}))
-
-	// With the sweep transaction fully signed, broadcast the transaction
-	// to the network. Additionally, we can stop tracking these outputs as
-	// they've just been swept.
-	// TODO(conner): handle concrete error types returned from publication
-	if err := u.cfg.PublishTransaction(sweepTx); err != nil &&
-		!strings.Contains(err.Error(), "TX rejected:") {
-		utxnLog.Errorf("unable to broadcast sweep tx: %v, %v",
-			err, spew.Sdump(sweepTx))
-		return err
-	}
-
-	sweepTxID := sweepTx.TxHash()
-
-	utxnLog.Infof("Registering sweep tx %v for confs at height %d",
-		sweepTxID, classHeight)
-
-	confChan, err := u.cfg.Notifier.RegisterConfirmationsNtfn(
-		&sweepTxID, u.cfg.ConfDepth, classHeight)
-	if err != nil {
-		utxnLog.Errorf("unable to register notification for "+
-			"sweep confirmation: %v", sweepTxID)
-		return err
-	}
-
-	u.wg.Add(1)
-	go u.waitForGraduation(classHeight, kgtnOutputs, confChan)
-
-	return nil
+	return u.sweepCsvSpendableOutputsTxn(txWeight, inputs)
 }
 
-// createSweepTx creates a final sweeping transaction with all witnesses in
-// place for all inputs. The created transaction has a single output sending
-// all the funds back to the source wallet.
-func (u *utxoNursery) createSweepTx(txWeight uint64,
+// sweepCsvSpendableOutputsTxn creates a final sweeping transaction with all
+// witnesses in place for all inputs. The created transaction has a single
+// output sending all the funds back to the source wallet, after accounting for
+// the fee estimate.
+func (u *utxoNursery) sweepCsvSpendableOutputsTxn(txWeight uint64,
 	inputs []CsvSpendableOutput) (*wire.MsgTx, error) {
 
 	pkScript, err := u.cfg.GenSweepScript()
@@ -530,7 +527,6 @@ func (u *utxoNursery) createSweepTx(txWeight uint64,
 
 	// With all the inputs in place, use each output's unique witness
 	// function to generate the final witness required for spending.
-
 	addWitness := func(idx int, tso CsvSpendableOutput) error {
 		witness, err := tso.BuildWitness(u.cfg.Signer, sweepTx, hashCache, idx)
 		if err != nil {
@@ -549,6 +545,42 @@ func (u *utxoNursery) createSweepTx(txWeight uint64,
 	}
 
 	return sweepTx, nil
+}
+
+// sweepGraduatingKinders generates and broadcasts the transaction that
+// transfers control of funds from a channel commitment transaction to the
+// user's wallet.
+func (u *utxoNursery) sweepGraduatingKinders(classHeight uint32,
+	finalTx *wire.MsgTx, kgtnOutputs []kidOutput) error {
+
+	// With the sweep transaction fully signed, broadcast the transaction
+	// to the network. Additionally, we can stop tracking these outputs as
+	// they've just been swept.
+	// TODO(conner): handle concrete error types returned from publication
+	if err := u.cfg.PublishTransaction(finalTx); err != nil &&
+		!strings.Contains(err.Error(), "TX rejected:") {
+		utxnLog.Errorf("unable to broadcast sweep tx: %v, %v",
+			err, spew.Sdump(finalTx))
+		return err
+	}
+
+	finalTxID := finalTx.TxHash()
+
+	utxnLog.Infof("Registering sweep tx %v for confs at height %d",
+		finalTxID, classHeight)
+
+	confChan, err := u.cfg.Notifier.RegisterConfirmationsNtfn(
+		&finalTxID, u.cfg.ConfDepth, classHeight)
+	if err != nil {
+		utxnLog.Errorf("unable to register notification for "+
+			"sweep confirmation: %v", finalTxID)
+		return err
+	}
+
+	u.wg.Add(1)
+	go u.waitForGraduation(classHeight, kgtnOutputs, confChan)
+
+	return nil
 }
 
 // IncubateOutputs sends a request to utxoNursery to incubate the outputs
@@ -893,7 +925,7 @@ func (u *utxoNursery) waitForGraduation(classHeight uint32, kgtnOutputs []kidOut
 	defer u.mu.Unlock()
 
 	// Mark the confirmed kindergarten outputs as graduated.
-	if err := u.cfg.Store.GraduateKinder(kgtnOutputs); err != nil {
+	if err := u.cfg.Store.GraduateKinder(classHeight, kgtnOutputs); err != nil {
 		utxnLog.Errorf("Unable to award diplomas to %v"+
 			"graduating outputs: %v", len(kgtnOutputs), err)
 		return
