@@ -19,68 +19,121 @@ import (
 	"github.com/roasbeef/btcutil"
 )
 
+//                          SUMMARY OF OUTPUT STATES
+//
+//  - CRIB (babyOutput) outputs are two-stage htlc outputs that are initially
+//    locked using a CLTV delay, followed by a CSV delay. The first stage of a
+//    crib output requires broadcasting a presigned htlc timeout txn generated
+//    by the wallet after an absolute expiry height. Since the timeout txns are
+//    predetermined, they cannot be batched after-the-fact, meaning that all
+//    CRIB outputs are broadcast and confirmed independently. After the first
+//    stage is complete, a CRIB output is moved to the KNDR state, which will
+//    finishing sweeping the second-layer CSV delay.
+//
+//  - PSCL (kidOutput) outputs are commitment outputs locked under a CSV delay.
+//    These outputs are stored temporarily in this state until the commitment
+//    transaction confirms, as this solidifies an absolute height that the
+//    relative time lock will expire. Once this maturity height is determined,
+//    the PSCL output is moved into KNDR.
+//
+//  - KNDR (kidOutput) outputs are CSV delayed outputs for which the maturity
+//    height has been fully determined. This results from having received
+//    confirmation of the UTXO we are trying to spend, contained in either the
+//    commitment txn or htlc timeout txn. Once the maturity height is reached,
+//    the utxo nursery will sweep all KNDR outputs scheduled for that height
+//    using a single txn.
+//
+//    NOTE: Due to the fact that KNDR outputs can be dynamically aggregated and
+//    swept, we make precautions to finalize the KNDR outputs at a particular
+//    height on our first attempt to sweep it. Finalizing involves signing the
+//    sweep transaction and persisting it in the nursery store, and recording
+//    the last finalized height. Any attempts to replay an already finalized
+//    height will result in broadcasting the already finalized txn, ensuring the
+//    nursery does not broadcast different txids for the same batch of KNDR
+//    outputs. The reason txids may change is due to the probabilistic nature of
+//    generating the pkscript in the sweep txn's output, even if the set of
+//    inputs remains static across attempts.
+//
+//  - GRAD (kidOutput) outputs are KNDR outputs that have successfully been
+//    swept into the user's wallet. A channel is considered mature once all of
+//    its outputs, including two-stage htlcs, have entered the GRAD state,
+//    indicating that it safe to mark the channel as fully closed.
+//
+//
 //                     OUTPUT STATE TRANSITIONS IN UTXO NURSERY
 //
-//       ┌────────────────┐            ┌──────────────┐
-//       │ Commit Outputs │            │ HTLC Outputs │
-//       └────────────────┘            └──────────────┘
-//                │                            │
-//                │                            │
-//                │                            │
-//    ┌─ ─ ─ ─ ─ ─┼─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ┼ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ┐
-//    │           │                            │                               │
-//    │           │                            │                               │
-//    │           │                            │             UTXO NURSERY      │
-//    │           │                            V                               │
-//    │           │                        ┌──────┐                            │
-//    │           │                        │ CRIB │                            │
-//    │           │                        └──────┘                            │
-//    │           │                            │                               │
-//    │           │                            │                               │
-//    │           V                            |                               │
-//    │       ┌──────┐                         V    Wait CLTV                  │
-//    │       │ PSCL │                        [ ]       +                      │
-//    │       └──────┘                         |   Publish Txn                 │
-//    │           │                            │                               │
-//    │           │                            │                               │
-//    │           V ┌ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ┐    V ┌ ─ ─ ─ ─ ─ ─ ─ ─ ─ ┐         │
-//    │          ( )   waitForPromotion       ( )  waitForEnrollment           │
-//    │           ' └ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ┘    | └ ─ ─ ─ ─ ─ ─ ─ ─ ─ ┘         │
-//    │           │                            │                               │
-//    │           │                            │                               │
-//    │           │                            V                               │
-//    │           │                        ┌──────┐                            │
-//    │           └— — — — — — — — — — — —>│ KNDR │                            │
-//    │                                    └──────┘                            │
-//    │                                        │                               │
-//    │                                        │                               │
-//    │                                        |                               │
-//    │                                        V     Wait CSV                  │
-//    │                                       [ ]       +                      │
-//    │                                        |   Publish Txn                 │
-//    │                                        │                               │
-//    │                                        │                               │
-//    │                                        V ┌ ─ ─ ─ ─ ─ ─ ─ ─ ─ ┐         │
-//    │                                       ( )  waitForGraduation           │
-//    │                                        | └ ─ ─ ─ ─ ─ ─ ─ ─ ─ ┘         │
-//    │                                        │                               │
-//    │                                        │                               │
-//    │                                        V                               │
-//    │                                     ┌──────┐                           │
-//    │                                     │ GRAD │                           │
-//    │                                     └──────┘                           │
-//    │                                        │                               │
-//    │                                        │                               │
-//    │                                        │                               │
-//    │                                        │                               │
-//    └─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ┼ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ┘
-//                                             │
-//                                             │
-//                                             │
-//                                             V
-//                                    ┌────────────────┐
-//                                    │ Wallet Outputs │
-//                                    └────────────────┘
+//      ┌────────────────┐            ┌──────────────┐
+//      │ Commit Outputs │            │ HTLC Outputs │
+//      └────────────────┘            └──────────────┘
+//               │                            │
+//               │                            │
+//               │                            │               UTXO NURSERY
+//   ┌───────────┼────────────────┬───────────┼───────────────────────────────┐
+//   │           │                            │                               │
+//   │           │                │           │                               │
+//   │           │                            │           CLTV-Delayed        │
+//   │           │                │           V            babyOutputs        │
+//   │           │                        ┌──────┐                            │
+//   │           │                │       │ CRIB │                            │
+//   │           │                        └──────┘                            │
+//   │           │                │           │                               │
+//   │           │                            │                               │
+//   │           │                │           |                               │
+//   │           │                            V    Wait CLTV                  │
+//   │           │                │         ▕[ ]       +                      │
+//   │           │                            |   Publish Txn                 │
+//   │           │                │           │                               │
+//   │           │                            │                               │
+//   │           │                │           V ┌ ─ ─ ─ ─ ─ ─ ─ ─ ─ ┐         │
+//   │           │                           ( )  waitForEnrollment           │
+//   │           │                │           | └ ─ ─ ─ ─ ─ ─ ─ ─ ─ ┘         │
+//   │           │                            │                               │
+//   │           │                │           │                               │
+//   │           │                            │                               │
+//   │           V                │           │                               │
+//   │       ┌──────┐                         │                               │
+//   │       │ PSCL │             └  ──  ──  ─┼  ──  ──  ──  ──  ──  ──  ──  ─┤
+//   │       └──────┘                         │                               │
+//   │           │                            │                               │
+//   │           │                            │                               │
+//   │           V ┌ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ┐    │            CSV-Delayed        │
+//   │          ( )   waitForPromotion        │             kidOutputs        │
+//   │           | └ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ┘    │                               │
+//   │           │                            │                               │
+//   │           │                            │                               │
+//   │           │                            V                               │
+//   │           │                        ┌──────┐                            │
+//   │           └─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─▶│ KNDR │                            │
+//   │                                    └──────┘                            │
+//   │                                        │                               │
+//   │                                        │                               │
+//   │                                        |                               │
+//   │                                        V     Wait CSV                  │
+//   │                                      ▕[ ]       +                      │
+//   │                                        |   Publish Txn                 │
+//   │                                        │                               │
+//   │                                        │                               │
+//   │                                        V ┌ ─ ─ ─ ─ ─ ─ ─ ─ ─ ┐         │
+//   │                                       ( )  waitForGraduation           │
+//   │                                        | └ ─ ─ ─ ─ ─ ─ ─ ─ ─ ┘         │
+//   │                                        │                               │
+//   │                                        │                               │
+//   │                                        V                               │
+//   │                                     ┌──────┐                           │
+//   │                                     │ GRAD │                           │
+//   │                                     └──────┘                           │
+//   │                                        │                               │
+//   │                                        │                               │
+//   │                                        │                               │
+//   └────────────────────────────────────────┼───────────────────────────────┘
+//                                            │
+//                                            │
+//                                            │
+//                                            │
+//                                            V
+//                                   ┌────────────────┐
+//                                   │ Wallet Outputs │
+//                                   └────────────────┘
 
 var byteOrder = binary.BigEndian
 
@@ -174,13 +227,12 @@ func (u *utxoNursery) Start() error {
 
 	utxnLog.Tracef("Starting UTXO nursery")
 
-	// 1. Flushing all fully-graduated channels from the pipeline.
+	// 1. Flush all fully-graduated channels from the pipeline.
 
 	// Load any pending close channels, which represents the super set of
 	// all channels that may still be incubating.
 	pendingCloseChans, err := u.cfg.DB.FetchClosedChannels(true)
 	if err != nil {
-		utxnLog.Errorf("Unable to fetch closing channels: %v", err)
 		return err
 	}
 
@@ -195,29 +247,27 @@ func (u *utxoNursery) Start() error {
 	// TODO(conner): check if any fully closed channels can be removed from
 	// utxn.
 
-	// 2. Restart spend ntfns for any preschool outputs.
-
-	// Query the database for the most recently processed block. We'll use
-	// this to restrict the search space when asking for confirmation
-	// notifications, and also to scan the chain to graduate now mature
-	// outputs.
+	// Query the nursery store for the lowest block height we could be
+	// incubating, which is taken to be the last height for which the
+	// database was pruned.
 	lastPrunedHeight, err := u.cfg.Store.LastPurgedHeight()
 	if err != nil {
 		return err
 	}
 
-	// Spawn spend notifications for any outputs found in preschool.
-	// NOTE: These next step *may* spawn go routines, thus from this point
-	// forward, we must close the nursery's quit channel if we detect a
-	// failure to ensure they terminate.
+	// 2. Restart spend ntfns for any preschool outputs, which are waiting
+	// for the force closed commitment txn to confirm.
+	//
+	// NOTE: The next two steps *may* spawn go routines, thus from this
+	// point forward, we must close the nursery's quit channel if we detect
+	// any failures during startup to ensure they terminate.
 	if err := u.reloadPreschool(lastPrunedHeight); err != nil {
 		close(u.quit)
 		return err
 	}
 
-	// 3. Replay all crib and kindergarten outputs from last finalized to
+	// 3. Replay all crib and kindergarten outputs from last pruned to
 	// current best height.
-
 	if err := u.reloadClasses(lastPrunedHeight); err != nil {
 		close(u.quit)
 		return err
@@ -235,13 +285,8 @@ func (u *utxoNursery) Start() error {
 		return err
 	}
 
-	lastFinalizedHeight, err := u.cfg.Store.LastFinalizedHeight()
-	if err != nil {
-		return err
-	}
-
 	u.wg.Add(1)
-	go u.incubator(newBlockChan, lastFinalizedHeight)
+	go u.incubator(newBlockChan)
 
 	return nil
 }
@@ -317,15 +362,14 @@ func (u *utxoNursery) reloadClasses(lastPrunedHeight uint32) error {
 		// there may be background processes attempting to modify the
 		// database concurrently.
 		u.mu.Lock()
-		if err := u.graduateClass(curHeight); err != nil {
-			u.mu.Unlock()
+		err := u.graduateClass(curHeight)
+		u.mu.Unlock()
+
+		if err != nil {
 			utxnLog.Errorf("Failed to graduate outputs at height=%v: %v",
 				curHeight, err)
 			return err
-		} else {
-			utxnLog.Infof("Regraduated outputs at height=%v", curHeight)
 		}
-		u.mu.Unlock()
 	}
 
 	utxnLog.Infof("UTXO Nursery is now fully synced")
@@ -342,28 +386,45 @@ func (u *utxoNursery) graduateClass(classHeight uint32) error {
 	// Record this height as the nursery's current best height.
 	u.currentHeight = classHeight
 
-	lastFinalizedHeight, err := u.cfg.Store.LastFinalizedHeight()
-	if err != nil {
-		return err
-	}
-
-	// First fetch the set of outputs that we can "graduate" at this
-	// particular block height. We can graduate an output once we've
-	// reached its height maturity.
+	// Fetch all information about the crib and kindergarten outputs at this
+	// height. In addition to the outputs, we also retrieve the finalized
+	// kindergarten sweep txn, which will be nil if we have not attempted
+	// this height before, or if no kindergarten outputs exist at this
+	// height.
 	finalTx, kgtnOutputs, cribOutputs, err := u.cfg.Store.FetchClass(
 		classHeight)
 	if err != nil {
 		return err
 	}
 
+	// Load the last finalized height, so we can determine if the
+	// kindergarten sweep txn should be crafted.
+	lastFinalizedHeight, err := u.cfg.Store.LastFinalizedHeight()
+	if err != nil {
+		return err
+	}
+
+	// If we haven't processed this height before, we finalize the
+	// graduating kindergarten outputs, by signing a sweep transaction that
+	// spends from them. This txn is persisted such that we never broadcast
+	// a different txn for the same height. This allows us to recover from
+	// failures, and watch for the correct txid.
 	if classHeight > lastFinalizedHeight {
+		// If this height has never been finalized, we have never
+		// generated a sweep txn for this height. Generate one if there
+		// are kindergarten outputs to be spent.
 		if len(kgtnOutputs) > 0 {
 			finalTx, err = u.createSweepTx(kgtnOutputs)
 			if err != nil {
+				utxnLog.Errorf("Failed to create sweep txn at "+
+					"height %d", classHeight)
 				return err
 			}
 		}
 
+		// Persist the kindergarten sweep txn to the nursery store. It
+		// is safe to store a nil finalTx, which happens if there are no
+		// graduating kindergarten outputs.
 		err = u.cfg.Store.FinalizeKinder(classHeight, finalTx)
 		if err != nil {
 			utxnLog.Errorf("Failed to finalize height %d",
@@ -372,75 +433,63 @@ func (u *utxoNursery) graduateClass(classHeight uint32) error {
 			return err
 		}
 
-		utxnLog.Infof("Successfully finalized height %d ",
-			classHeight)
+		// Log if the finalized transaction is non-trivial.
+		if finalTx != nil {
+			utxnLog.Infof("Finalized kindergarten at height %d ",
+				classHeight)
+		}
 	}
 
+	// Now that the kindergarten sweep txn has either been finalized or
+	// restored, broadcast the txn, and set up notifications that will
+	// transition the swept kindergarten outputs into graduated outputs.
 	if finalTx != nil {
 		utxnLog.Infof("Sweeping %v time-locked outputs "+
 			"with sweep tx (txid=%v): %v", len(kgtnOutputs),
-			finalTx.TxHash(),
-			newLogClosure(func() string {
+			finalTx.TxHash(), newLogClosure(func() string {
 				return spew.Sdump(finalTx)
 			}))
 
 		err := u.sweepGraduatingKinders(classHeight, finalTx,
 			kgtnOutputs)
 		if err != nil {
+			utxnLog.Errorf("Failed to sweep %d kindergarten outputs "+
+				"at height %d: %v", len(kgtnOutputs), classHeight,
+				err)
 			return err
 		}
-	} else {
-		utxnLog.Infof("No finalized txn at height %d", classHeight)
 	}
 
+	// Now, we broadcast all pre-signed htlc txns from the crib outputs at
+	// this height. There is no need to finalize these txns, since the txid
+	// is predetermined when signed in the wallet.
 	for i := range cribOutputs {
-		output := &cribOutputs[i]
-
-		// Broadcast HTLC transaction
-		// TODO(conner): handle concrete error types returned from publication
-		err = u.cfg.PublishTransaction(output.timeoutTx)
-		if err != nil &&
-			!strings.Contains(err.Error(), "TX rejected:") {
-			utxnLog.Errorf("Unable to broadcast baby tx: "+
-				"%v, %v", err,
-				spew.Sdump(output.timeoutTx))
-			return err
-		}
-
-		birthTxID := output.OutPoint().Hash
-
-		// Register for the confirmation of baby tx
-		confChan, err := u.cfg.Notifier.RegisterConfirmationsNtfn(
-			&birthTxID, u.cfg.ConfDepth, classHeight)
+		err := u.sweepCribOutput(classHeight, &cribOutputs[i])
 		if err != nil {
+			utxnLog.Errorf("Failed to sweep crib output %v",
+				cribOutputs[i].OutPoint())
 			return err
 		}
-
-		utxnLog.Infof("Baby output %v registered for promotion "+
-			"notification.", output.OutPoint())
-
-		u.wg.Add(1)
-		go u.waitForEnrollment(output, confChan)
-
 	}
 
-	// Can't finalize height below the reorg safety depth.
+	// Can't purge height below the reorg safety depth.
 	if u.cfg.PruningDepth >= classHeight {
 		return nil
 	}
 
-	// Finalize and purge all state below the threshold height.
+	// Otherwise, purge all state below our threshold height.
 	heightToPurge := classHeight - u.cfg.PruningDepth
 	if err := u.cfg.Store.PurgeHeight(heightToPurge); err != nil {
 		utxnLog.Errorf("Failed to purge height %d", heightToPurge)
 		return err
 	}
 
-	utxnLog.Infof("Successfully purged height %d ", heightToPurge)
-
 	return nil
 }
 
+// craftSweepTx accepts accepts a list of kindergarten outputs, and signs and
+// generates a signed txn that spends from them. This method also makes an
+// accurate fee estimate before generating the required witnesses.
 func (u *utxoNursery) createSweepTx(kgtnOutputs []kidOutput) (*wire.MsgTx, error) {
 	// Create a transaction which sweeps all the newly mature outputs into
 	// a output controlled by the wallet.
@@ -482,32 +531,41 @@ func (u *utxoNursery) createSweepTx(kgtnOutputs []kidOutput) (*wire.MsgTx, error
 }
 
 // sweepCsvSpendableOutputsTxn creates a final sweeping transaction with all
-// witnesses in place for all inputs. The created transaction has a single
-// output sending all the funds back to the source wallet, after accounting for
-// the fee estimate.
+// witnesses in place for all inputs using the provided txn fee. The created
+// transaction has a single output sending all the funds back to the source
+// wallet, after accounting for the fee estimate.
 func (u *utxoNursery) sweepCsvSpendableOutputsTxn(txWeight uint64,
 	inputs []CsvSpendableOutput) (*wire.MsgTx, error) {
 
+	// Generate the receiving script to which the funds will be swept.
 	pkScript, err := u.cfg.GenSweepScript()
 	if err != nil {
 		return nil, err
 	}
 
+	// Sum up the total value contained in the inputs.
 	var totalSum btcutil.Amount
 	for _, o := range inputs {
 		totalSum += o.Amount()
 	}
 
+	// Using the txn weight estimate, compute the required txn fee.
 	feePerWeight := u.cfg.Estimator.EstimateFeePerWeight(1)
 	txFee := btcutil.Amount(txWeight * feePerWeight)
 
+	// Sweep as much possible, after subtracting txn fees.
 	sweepAmt := int64(totalSum - txFee)
 
+	// Create the sweep transaction that we will be building. We use version
+	// 2 as it is required for CSV. The txn will sweep the amount after fees
+	// to the pkscript generated above.
 	sweepTx := wire.NewMsgTx(2)
 	sweepTx.AddTxOut(&wire.TxOut{
 		PkScript: pkScript,
 		Value:    sweepAmt,
 	})
+
+	// Add all of our inputs, including the respective CSV delays.
 	for _, input := range inputs {
 		sweepTx.AddTxIn(&wire.TxIn{
 			PreviousOutPoint: *input.OutPoint(),
@@ -583,6 +641,39 @@ func (u *utxoNursery) sweepGraduatingKinders(classHeight uint32,
 	return nil
 }
 
+// sweepCribOutput broadcasts the crib output's htlc timeout txn, and sets up a
+// notification that will advance it to the kindergarten bucket upon
+// confirmation.
+func (u *utxoNursery) sweepCribOutput(classHeight uint32, baby *babyOutput) error {
+	// Broadcast HTLC transaction
+	// TODO(conner): handle concrete error types returned from publication
+	err := u.cfg.PublishTransaction(baby.timeoutTx)
+	if err != nil &&
+		!strings.Contains(err.Error(), "TX rejected:") {
+		utxnLog.Errorf("Unable to broadcast baby tx: "+
+			"%v, %v", err,
+			spew.Sdump(baby.timeoutTx))
+		return err
+	}
+
+	birthTxID := baby.OutPoint().Hash
+
+	// Register for the confirmation of presigned htlc txn.
+	confChan, err := u.cfg.Notifier.RegisterConfirmationsNtfn(
+		&birthTxID, u.cfg.ConfDepth, classHeight)
+	if err != nil {
+		return err
+	}
+
+	utxnLog.Infof("Baby output %v registered for promotion "+
+		"notification.", baby.OutPoint())
+
+	u.wg.Add(1)
+	go u.waitForEnrollment(baby, confChan)
+
+	return nil
+}
+
 // IncubateOutputs sends a request to utxoNursery to incubate the outputs
 // defined within the summary of a closed channel. Individually, as all outputs
 // reach maturity, they'll be swept back into the wallet.
@@ -642,8 +733,13 @@ func (u *utxoNursery) IncubateOutputs(closeSummary *lnwallet.ForceCloseSummary) 
 
 	}
 
-	// 2. Persist the outputs we intended to sweep in the nursery store
+	// If there are no outputs to incubate for this channel, we simply mark
+	// the channel as fully closed.
+	if commOutput == nil && len(htlcOutputs) == 0 {
+		return u.cfg.DB.MarkChanFullyClosed(&closeSummary.ChanPoint)
+	}
 
+	// 2. Persist the outputs we intended to sweep in the nursery store
 	if err := u.cfg.Store.Incubate(commOutput, htlcOutputs); err != nil {
 		utxnLog.Infof("Unable to persist incubation of channel %v: %v",
 			&closeSummary.ChanPoint, err)
@@ -652,7 +748,6 @@ func (u *utxoNursery) IncubateOutputs(closeSummary *lnwallet.ForceCloseSummary) 
 
 	// 3. If we are incubating a preschool output, register for a spend
 	// notification that will transition it to the kindergarten bucket.
-
 	if commOutput != nil {
 		commitTxID := commOutput.OutPoint().Hash
 
@@ -687,14 +782,11 @@ func (u *utxoNursery) IncubateOutputs(closeSummary *lnwallet.ForceCloseSummary) 
 // kindergarten bucket or 2) move a kindergarten output into the graduated
 // bucket. The incubator is also designed to purge all state below the config's
 // PruningDepth to avoid indefinitely persisting stale data.
-func (u *utxoNursery) incubator(newBlockChan *chainntnfs.BlockEpochEvent,
-	startingHeight uint32) {
+func (u *utxoNursery) incubator(newBlockChan *chainntnfs.BlockEpochEvent) {
 
 	defer u.wg.Done()
 	defer newBlockChan.Cancel()
 
-	u.currentHeight = startingHeight
-out:
 	for {
 		select {
 		case epoch, ok := <-newBlockChan.Epochs:
@@ -711,20 +803,24 @@ out:
 			// will give stale data
 
 			// A new block has just been connected to the main
-			// chain which means we might be able to graduate some
-			// outputs out of the kindergarten bucket. Graduation
-			// entails successfully sweeping a time-locked output.
+			// chain, which means we might be able to graduate crib
+			// or kindergarten outputs at this height. This involves
+			// broadcasting any presigned htlc timeout txns, as well
+			// as signing and broadcasting a sweep txn that spends
+			// from all kindergarten outputs at this height.
 			height := uint32(epoch.Height)
 
 			u.mu.Lock()
-			if err := u.graduateClass(height); err != nil {
-				utxnLog.Errorf("error while graduating "+
-					"kindergarten outputs: %v", err)
-			}
+			err := u.graduateClass(height)
 			u.mu.Unlock()
 
+			if err != nil {
+				utxnLog.Errorf("error while graduating "+
+					"class at height %d: %v", height, err)
+			}
+
 		case <-u.quit:
-			break out
+			return
 		}
 	}
 }
@@ -748,8 +844,8 @@ type contractMaturityReport struct {
 	// reach maturity.
 	maturityRequirement uint32
 
-	// maturityHeight is the absolute block height that this output will mature
-	// at.
+	// maturityHeight is the absolute block height that this output will
+	// mature at.
 	maturityHeight uint32
 }
 
@@ -802,8 +898,8 @@ func (u *utxoNursery) NurseryReport(
 			utxnLog.Infof("NurseryReport: found crib output: %x", k[4:])
 
 		case string(gradPrefix):
-
 			utxnLog.Infof("NurseryReport: found grad output: %x", k[4:])
+
 		default:
 		}
 
@@ -975,12 +1071,10 @@ func (u *utxoNursery) closeAndRemoveIfMature(chanPoint *wire.OutPoint) error {
 		return err
 	}
 
+	// Nothing to do if we are still incubating.
 	if !isMature {
-		utxnLog.Errorf("Not closing immature channel %v", chanPoint)
 		return nil
 	}
-
-	utxnLog.Infof("Attempting to close mature channel %v", chanPoint)
 
 	// Now that the sweeping transaction has been broadcast, for
 	// each of the immature outputs, we'll mark them as being fully
@@ -992,7 +1086,7 @@ func (u *utxoNursery) closeAndRemoveIfMature(chanPoint *wire.OutPoint) error {
 		return err
 	}
 
-	utxnLog.Infof("Successfully marked channel %v as fully closed", chanPoint)
+	utxnLog.Infof("Marked channel %v as fully closed", chanPoint)
 
 	if err := u.cfg.Store.RemoveChannel(chanPoint); err != nil {
 		utxnLog.Errorf("Unable to remove channel %v from "+
@@ -1000,7 +1094,7 @@ func (u *utxoNursery) closeAndRemoveIfMature(chanPoint *wire.OutPoint) error {
 		return err
 	}
 
-	utxnLog.Infof("Successfully removed channel %v from nursery store", chanPoint)
+	utxnLog.Infof("Removed channel %v from nursery store", chanPoint)
 
 	return nil
 }
