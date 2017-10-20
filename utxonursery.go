@@ -21,6 +21,32 @@ import (
 
 //                          SUMMARY OF OUTPUT STATES
 //
+//  - CRIB
+//    - SerializedType: babyOutput
+//    - OriginalOutputType: HTLC
+//    - Awaiting: First-stage HTLC CLTV expiry
+//    - HeightIndexEntry: Absolute block height of CLTV expiry.
+//    - NextState: KNDR
+//  - PSCL
+//    - SerializedType: kidOutput
+//    - OriginalOutputType: Commitment
+//    - Awaiting: Confirmation of commitment txn
+//    - HeightIndexEntry: None.
+//    - NextState: KNDR
+//  - KNDR
+//    - SerializedType: kidOutput
+//    - OriginalOutputType: Commitment or HTLC
+//    - Awaiting: Commitment CSV expiry or second-stage HTLC CSV expiry.
+//    - HeightIndexEntry: Input confirmation height + relative CSV delay
+//    - NextState: GRAD
+//  - GRAD:
+//    - SerializedType: kidOutput
+//    - OriginalOutputType: Commitment or HTLC
+//    - Awaiting: All other outputs in channel to become GRAD.
+//    - NextState: Mark channel fully closed in channeldb and remove.
+//
+//                        DESCRIPTION OF OUTPUT STATES
+//
 //  - CRIB (babyOutput) outputs are two-stage htlc outputs that are initially
 //    locked using a CLTV delay, followed by a CSV delay. The first stage of a
 //    crib output requires broadcasting a presigned htlc timeout txn generated
