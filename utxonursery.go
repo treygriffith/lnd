@@ -80,7 +80,7 @@ import (
 //   │           │                            │                               │
 //   │           │                │           |                               │
 //   │           │                            V    Wait CLTV                  │
-//   │           │                │         ▕[ ]       +                      │
+//   │           │                │          [ ]       +                      │
 //   │           │                            |   Publish Txn                 │
 //   │           │                │           │                               │
 //   │           │                            │                               │
@@ -109,7 +109,7 @@ import (
 //   │                                        │                               │
 //   │                                        |                               │
 //   │                                        V     Wait CSV                  │
-//   │                                      ▕[ ]       +                      │
+//   │                                       [ ]       +                      │
 //   │                                        |   Publish Txn                 │
 //   │                                        │                               │
 //   │                                        │                               │
@@ -239,7 +239,8 @@ func (u *utxoNursery) Start() error {
 	// Ensure that all mature channels have been marked as fully closed in
 	// the channeldb.
 	for _, pendingClose := range pendingCloseChans {
-		if err := u.closeAndRemoveIfMature(&pendingClose.ChanPoint); err != nil {
+		err := u.closeAndRemoveIfMature(&pendingClose.ChanPoint)
+		if err != nil {
 			return err
 		}
 	}
@@ -249,8 +250,8 @@ func (u *utxoNursery) Start() error {
 
 	// Query the nursery store for the lowest block height we could be
 	// incubating, which is taken to be the last height for which the
-	// database was pruned.
-	lastPrunedHeight, err := u.cfg.Store.LastPurgedHeight()
+	// database was purged.
+	lastPurgedHeight, err := u.cfg.Store.LastPurgedHeight()
 	if err != nil {
 		return err
 	}
@@ -261,14 +262,14 @@ func (u *utxoNursery) Start() error {
 	// NOTE: The next two steps *may* spawn go routines, thus from this
 	// point forward, we must close the nursery's quit channel if we detect
 	// any failures during startup to ensure they terminate.
-	if err := u.reloadPreschool(lastPrunedHeight); err != nil {
+	if err := u.reloadPreschool(lastPurgedHeight); err != nil {
 		close(u.quit)
 		return err
 	}
 
 	// 3. Replay all crib and kindergarten outputs from last pruned to
 	// current best height.
-	if err := u.reloadClasses(lastPrunedHeight); err != nil {
+	if err := u.reloadClasses(lastPurgedHeight); err != nil {
 		close(u.quit)
 		return err
 	}
@@ -323,8 +324,8 @@ func (u *utxoNursery) reloadPreschool(heightHint uint32) error {
 			return err
 		}
 
-		utxnLog.Infof("Preschool outpoint %v re-registered for confirmation "+
-			"notification.", kid.OutPoint())
+		utxnLog.Infof("Preschool outpoint %v re-registered for "+
+			"confirmation notification.", kid.OutPoint())
 
 		u.wg.Add(1)
 		go u.waitForPromotion(&psclOutputs[i], confChan)
@@ -817,6 +818,8 @@ func (u *utxoNursery) incubator(newBlockChan *chainntnfs.BlockEpochEvent) {
 			if err != nil {
 				utxnLog.Errorf("error while graduating "+
 					"class at height %d: %v", height, err)
+
+				// TODO(conner): signal fatal error to daemon
 			}
 
 		case <-u.quit:
@@ -864,8 +867,9 @@ func (u *utxoNursery) NurseryReport(
 		var prefix [4]byte
 		copy(prefix[:], k[:4])
 
-		switch string(prefix[:]) {
-		case string(psclPrefix), string(kndrPrefix):
+		switch {
+		case bytes.HasPrefix(k, psclPrefix),
+			bytes.HasPrefix(k, kndrPrefix):
 
 			// information for this immature output.
 			var kid kidOutput
@@ -894,10 +898,10 @@ func (u *utxoNursery) NurseryReport(
 					kid.ConfHeight())
 			}
 
-		case string(cribPrefix):
+		case bytes.HasPrefix(k, cribPrefix):
 			utxnLog.Infof("NurseryReport: found crib output: %x", k[4:])
 
-		case string(gradPrefix):
+		case bytes.HasPrefix(k, gradPrefix):
 			utxnLog.Infof("NurseryReport: found grad output: %x", k[4:])
 
 		default:
@@ -1088,6 +1092,10 @@ func (u *utxoNursery) closeAndRemoveIfMature(chanPoint *wire.OutPoint) error {
 
 	utxnLog.Infof("Marked channel %v as fully closed", chanPoint)
 
+	// Now that the channel is fully closed, we remove the channel from the
+	// nursery store here. This preserves the invariant that we never remove
+	// a channel unless it is mature, as this is the only place the utxo
+	// nursery removes a channel.
 	if err := u.cfg.Store.RemoveChannel(chanPoint); err != nil {
 		utxnLog.Errorf("Unable to remove channel %v from "+
 			"nursery store: %v", chanPoint, err)
@@ -1101,8 +1109,8 @@ func (u *utxoNursery) closeAndRemoveIfMature(chanPoint *wire.OutPoint) error {
 
 // newSweepPkScript creates a new public key script which should be used to
 // sweep any time-locked, or contested channel funds into the wallet.
-// Specifically, the script generated is a version 0,
-// pay-to-witness-pubkey-hash (p2wkh) output.
+// Specifically, the script generated is a version 0, pay-to-witness-pubkey-hash
+// (p2wkh) output.
 func newSweepPkScript(wallet lnwallet.WalletController) ([]byte, error) {
 	sweepAddr, err := wallet.NewAddress(lnwallet.WitnessPubKey, false)
 	if err != nil {
@@ -1135,12 +1143,13 @@ type CsvSpendableOutput interface {
 	OriginChanPoint() *wire.OutPoint
 }
 
-// babyOutput is an HTLC output that is in the earliest stage of upbringing.
-// Each babyOutput carries a presigned timeout transction, which should be
-// broadcast at the appropriate CLTV expiry, and its future kidOutput self. If
-// all goes well, and the timeout transaction is successfully confirmed, the
-// the now-mature kidOutput will be unwrapped and continue its journey through
-// the nursery.
+// babyOutput represents a two-stage CSV locked output, and is used to track
+// htlc outputs through incubation. The first stage requires broadcasting a
+// presigned timeout txn that spends from the CLTV locked output on the
+// commitment txn. A babyOutput is treated as a subset of CsvSpendableOutputs,
+// with the additional constraint that a transaction must be broadcast before it
+// can be spent. Each baby transaction embeds the kidOutput that can later be
+// used to spend the CSV output contained in the timeout txn.
 type babyOutput struct {
 	// expiry is the absolute block height at which the timeoutTx should be
 	// broadcast to the network.
@@ -1150,8 +1159,8 @@ type babyOutput struct {
 	// transitions the htlc into the delay+claim stage.
 	timeoutTx *wire.MsgTx
 
-	// kidOutput represents the CSV output to be swept after the timeoutTx has
-	// been broadcast and confirmed.
+	// kidOutput represents the CSV output to be swept from the timeoutTx
+	// after it has been broadcast and confirmed.
 	kidOutput
 }
 
