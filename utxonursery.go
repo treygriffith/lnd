@@ -1028,8 +1028,8 @@ func (u *utxoNursery) waitForPromotion(kid *kidOutput,
 // received, the nursery will mark those outputs as fully graduated, and proceed
 // to mark any mature channels as fully closed in channeldb.
 // NOTE(conner): this method MUST be called as a go routine.
-func (u *utxoNursery) waitForGraduation(classHeight uint32, kgtnOutputs []kidOutput,
-	confChan *chainntnfs.ConfirmationEvent) {
+func (u *utxoNursery) waitForGraduation(classHeight uint32,
+	kgtnOutputs []kidOutput, confChan *chainntnfs.ConfirmationEvent) {
 
 	defer u.wg.Done()
 
@@ -1037,7 +1037,8 @@ func (u *utxoNursery) waitForGraduation(classHeight uint32, kgtnOutputs []kidOut
 	case _, ok := <-confChan.Confirmed:
 		if !ok {
 			utxnLog.Errorf("Notification chan closed, can't"+
-				" advance %v graduating outputs", len(kgtnOutputs))
+				" advance %v graduating outputs",
+				len(kgtnOutputs))
 			return
 		}
 
@@ -1051,7 +1052,7 @@ func (u *utxoNursery) waitForGraduation(classHeight uint32, kgtnOutputs []kidOut
 	defer u.mu.Unlock()
 
 	// Mark the confirmed kindergarten outputs as graduated.
-	if err := u.cfg.Store.GraduateKinder(classHeight, kgtnOutputs); err != nil {
+	if err := u.cfg.Store.GraduateKinder(classHeight); err != nil {
 		utxnLog.Errorf("Unable to award diplomas to %v"+
 			"graduating outputs: %v", len(kgtnOutputs), err)
 		return
@@ -1072,7 +1073,8 @@ func (u *utxoNursery) waitForGraduation(classHeight uint32, kgtnOutputs []kidOut
 	// outputs have been graduated.
 	for chanPoint := range possibleCloses {
 		if err := u.closeAndRemoveIfMature(&chanPoint); err != nil {
-			utxnLog.Errorf("Failed to close and remove channel %v", chanPoint)
+			utxnLog.Errorf("Failed to close and remove channel %v",
+				chanPoint)
 			return
 		}
 	}
