@@ -523,17 +523,26 @@ func (u *utxoNursery) createSweepTx(kgtnOutputs []kidOutput) (*wire.MsgTx, error
 	// TODO(roasbeef): car be more intelligent about buffering outputs to
 	// be more efficient on-chain.
 
-	// Gather the CSV delayed inputs to our sweep transaction, and construct
-	// an estimate for the weight of the sweep transaction.
-	inputs := make([]CsvSpendableOutput, 0, len(kgtnOutputs))
+	// Assemble the kindergarten class into a slice csv spendable outputs,
+	// while also computing an estimate for the total transaction weight.
+	var (
+		csvSpendableOutputs []CsvSpendableOutput
+		weightEstimate      lnwallet.TxWeightEstimator
+	)
 
-	var txWeight uint64
-	txWeight += 4*lnwallet.BaseSweepTxSize + lnwallet.WitnessHeaderSize
+	// Allocate enough room for each of the kindergarten outputs.
+	csvSpendableOutputs = make([]CsvSpendableOutput, 0, len(kgtnOutputs))
 
+	// Our sweep transaction will pay to a single segwit p2wkh address,
+	// ensure it contributes to our weight estimate.
+	weightEstimate.AddP2WKHOutput()
+
+	// For each kindergarten output, use its witness type to determine the
+	// estimate weight of its witness.
 	for i := range kgtnOutputs {
 		input := &kgtnOutputs[i]
 
-		var witnessWeight uint64
+		var witnessWeight int
 		switch input.WitnessType() {
 		case lnwallet.CommitmentTimeLock:
 			witnessWeight = lnwallet.ToLocalTimeoutWitnessSize
@@ -548,13 +557,16 @@ func (u *utxoNursery) createSweepTx(kgtnOutputs []kidOutput) (*wire.MsgTx, error
 			continue
 		}
 
-		txWeight += 4 * lnwallet.InputSize
-		txWeight += witnessWeight
+		// Add the kindergarten output's input and witness to our
+		// running estimate.
+		weightEstimate.AddWitnessInput(witnessWeight)
 
-		inputs = append(inputs, input)
+		// Include this input in the transaction.
+		csvSpendableOutputs = append(csvSpendableOutputs, input)
 	}
 
-	return u.sweepCsvSpendableOutputsTxn(txWeight, inputs)
+	txWeight := uint64(weightEstimate.Weight())
+	return u.sweepCsvSpendableOutputsTxn(txWeight, csvSpendableOutputs)
 }
 
 // sweepCsvSpendableOutputsTxn creates a final sweeping transaction with all
