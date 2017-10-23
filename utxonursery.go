@@ -110,9 +110,9 @@ import (
 //   │           │                            |   Publish Txn                 │
 //   │           │                │           │                               │
 //   │           │                            │                               │
-//   │           │                │           V ┌ ─ ─ ─ ─ ─ ─ ─ ─ ─ ┐         │
-//   │           │                           ( )  waitForEnrollment           │
-//   │           │                │           | └ ─ ─ ─ ─ ─ ─ ─ ─ ─ ┘         │
+//   │           │                │           V ┌ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─┐        │
+//   │           │                           ( )  waitForTimeoutConf          │
+//   │           │                │           | └ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─┘        │
 //   │           │                            │                               │
 //   │           │                │           │                               │
 //   │           │                            │                               │
@@ -122,9 +122,9 @@ import (
 //   │       └──────┘                         │                               │
 //   │           │                            │                               │
 //   │           │                            │                               │
-//   │           V ┌ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ┐    │            CSV-Delayed        │
-//   │          ( )   waitForPromotion        │             kidOutputs        │
-//   │           | └ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ┘    │                               │
+//   │           V ┌ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─┐     │            CSV-Delayed        │
+//   │          ( )  waitForCommitConf        │             kidOutputs        │
+//   │           | └ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─┘     │                               │
 //   │           │                            │                               │
 //   │           │                            │                               │
 //   │           │                            V                               │
@@ -140,7 +140,7 @@ import (
 //   │                                        │                               │
 //   │                                        │                               │
 //   │                                        V ┌ ─ ─ ─ ─ ─ ─ ─ ─ ─ ┐         │
-//   │                                       ( )  waitForGraduation           │
+//   │                                       ( )  waitForSweepConf            │
 //   │                                        | └ ─ ─ ─ ─ ─ ─ ─ ─ ─ ┘         │
 //   │                                        │                               │
 //   │                                        │                               │
@@ -354,7 +354,7 @@ func (u *utxoNursery) reloadPreschool(heightHint uint32) error {
 			"confirmation notification.", kid.OutPoint())
 
 		u.wg.Add(1)
-		go u.waitForPromotion(&psclOutputs[i], confChan)
+		go u.waitForCommitConf(&psclOutputs[i], confChan)
 	}
 
 	return nil
@@ -675,7 +675,7 @@ func (u *utxoNursery) sweepGraduatingKinders(classHeight uint32,
 	}
 
 	u.wg.Add(1)
-	go u.waitForGraduation(classHeight, kgtnOutputs, confChan)
+	go u.waitForSweepConf(classHeight, kgtnOutputs, confChan)
 
 	return nil
 }
@@ -708,7 +708,7 @@ func (u *utxoNursery) sweepCribOutput(classHeight uint32, baby *babyOutput) erro
 		"notification.", baby.OutPoint())
 
 	u.wg.Add(1)
-	go u.waitForEnrollment(baby, confChan)
+	go u.waitForTimeoutConf(baby, confChan)
 
 	return nil
 }
@@ -808,7 +808,7 @@ func (u *utxoNursery) IncubateOutputs(closeSummary *lnwallet.ForceCloseSummary) 
 		// the preschool bucket to the kindergarten bucket once the
 		// channel close transaction has been confirmed.
 		u.wg.Add(1)
-		go u.waitForPromotion(commOutput, confChan)
+		go u.waitForCommitConf(commOutput, confChan)
 	}
 
 	return nil
@@ -953,10 +953,10 @@ func (u *utxoNursery) NurseryReport(
 	return report, nil
 }
 
-// waitForEnrollment watches for the confirmation of an htlc timeout
+// waitForTimeoutConf watches for the confirmation of an htlc timeout
 // transaction, and attempts to move the htlc output from the crib bucket to the
 // kindergarten bucket upon success.
-func (u *utxoNursery) waitForEnrollment(baby *babyOutput,
+func (u *utxoNursery) waitForTimeoutConf(baby *babyOutput,
 	confChan *chainntnfs.ConfirmationEvent) {
 
 	defer u.wg.Done()
@@ -992,13 +992,13 @@ func (u *utxoNursery) waitForEnrollment(baby *babyOutput,
 		"kindergarten", baby.OutPoint())
 }
 
-// waitForPromotion is intended to be run as a goroutine that will wait until a
+// waitForCommitConf is intended to be run as a goroutine that will wait until a
 // channel force close commitment transaction has been included in a confirmed
 // block. Once the transaction has been confirmed (as reported by the Chain
-// Notifier), waitForPromotion will delete the output from the "preschool"
+// Notifier), waitForCommitConf will delete the output from the "preschool"
 // database bucket and atomically add it to the "kindergarten" database bucket.
 // This is the second step in the output incubation process.
-func (u *utxoNursery) waitForPromotion(kid *kidOutput,
+func (u *utxoNursery) waitForCommitConf(kid *kidOutput,
 	confChan *chainntnfs.ConfirmationEvent) {
 
 	defer u.wg.Done()
@@ -1035,12 +1035,12 @@ func (u *utxoNursery) waitForPromotion(kid *kidOutput,
 		"kindergarten", kid.OutPoint())
 }
 
-// waitForGraduation watches for the confirmation of a sweep transaction
+// waitForSweepConf watches for the confirmation of a sweep transaction
 // containing a batch of kindergarten outputs. Once confirmation has been
 // received, the nursery will mark those outputs as fully graduated, and proceed
 // to mark any mature channels as fully closed in channeldb.
 // NOTE(conner): this method MUST be called as a go routine.
-func (u *utxoNursery) waitForGraduation(classHeight uint32,
+func (u *utxoNursery) waitForSweepConf(classHeight uint32,
 	kgtnOutputs []kidOutput, confChan *chainntnfs.ConfirmationEvent) {
 
 	defer u.wg.Done()
