@@ -219,14 +219,6 @@ func loadConfig() (*config, error) {
 		return nil, err
 	}
 
-	// At this moment, multiple active chains are not supported.
-	if cfg.Litecoin.Active && cfg.Bitcoin.Active {
-		str := "%s: Currently both Bitcoin and Litecoin cannot be " +
-			"active together"
-		err := fmt.Errorf(str, funcName)
-		return nil, err
-	}
-
 	switch {
 	// The SPV mode implemented currently doesn't support Litecoin, so the
 	// two modes are incompatible.
