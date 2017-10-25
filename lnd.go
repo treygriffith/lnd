@@ -32,12 +32,9 @@ import (
 	"github.com/lightningnetwork/lnd/autopilot"
 	"github.com/lightningnetwork/lnd/channeldb"
 	"github.com/lightningnetwork/lnd/lnrpc"
-	"github.com/lightningnetwork/lnd/lnwallet"
-	"github.com/lightningnetwork/lnd/lnwire"
 	"github.com/lightningnetwork/lnd/macaroons"
 	"github.com/lightningnetwork/lnd/walletunlocker"
 	"github.com/roasbeef/btcd/btcec"
-	"github.com/roasbeef/btcutil"
 )
 
 const (
@@ -205,10 +202,10 @@ func lndMain() error {
 	// With the information parsed from the configuration, create valid
 	// instances of the pertinent interfaces required to operate the
 	// Lightning Network Daemon.
-	activeChainControl, chainCleanUp, err := newChainControlFromConfig(cfg,
+	chainCleanUp, err := newChainControlFromConfig(cfg,
 		chanDB, privateWalletPw, publicWalletPw)
 	if err != nil {
-		fmt.Printf("unable to create chain control: %v\n", err)
+		ltndLog.Errorf("unable to create chain controls: %v", err)
 		return err
 	}
 	if chainCleanUp != nil {
@@ -219,9 +216,14 @@ func lndMain() error {
 	// trinity" of interface for our current "home chain" with the active
 	// chainRegistry interface.
 	primaryChain := registeredChains.PrimaryChain()
-	registeredChains.RegisterChain(primaryChain, activeChainControl)
+	primaryChainControl, ok := registeredChains.LookupChain(primaryChain)
+	if !ok {
+		err := fmt.Errorf("unable to find primary chain control: %v", err)
+		ltndLog.Errorf(err.Error())
+		return err
+	}
 
-	idPrivKey, err := activeChainControl.wallet.GetIdentitykey()
+	idPrivKey, err := primaryChainControl.wallet.GetIdentitykey()
 	if err != nil {
 		return err
 	}
@@ -232,87 +234,12 @@ func lndMain() error {
 	defaultListenAddrs := []string{
 		net.JoinHostPort("", strconv.Itoa(cfg.PeerPort)),
 	}
-	server, err := newServer(defaultListenAddrs, chanDB, activeChainControl,
+	server, err := newServer(defaultListenAddrs, chanDB, registeredChains,
 		idPrivKey)
 	if err != nil {
 		srvrLog.Errorf("unable to create server: %v\n", err)
 		return err
 	}
-
-	// Next, we'll initialize the funding manager itself so it can answer
-	// queries while the wallet+chain are still syncing.
-	nodeSigner := newNodeSigner(idPrivKey)
-	var chanIDSeed [32]byte
-	if _, err := rand.Read(chanIDSeed[:]); err != nil {
-		return err
-	}
-	fundingMgr, err := newFundingManager(fundingConfig{
-		IDKey:        idPrivKey.PubKey(),
-		Wallet:       activeChainControl.wallet,
-		Notifier:     activeChainControl.chainNotifier,
-		FeeEstimator: activeChainControl.feeEstimator,
-		SignMessage: func(pubKey *btcec.PublicKey,
-			msg []byte) (*btcec.Signature, error) {
-
-			if pubKey.IsEqual(idPrivKey.PubKey()) {
-				return nodeSigner.SignMessage(pubKey, msg)
-			}
-
-			return activeChainControl.msgSigner.SignMessage(
-				pubKey, msg,
-			)
-		},
-		CurrentNodeAnnouncement: func() (lnwire.NodeAnnouncement, error) {
-			return server.genNodeAnnouncement(true)
-		},
-		SendAnnouncement: func(msg lnwire.Message) error {
-			errChan := server.authGossiper.ProcessLocalAnnouncement(msg,
-				idPrivKey.PubKey())
-			return <-errChan
-		},
-		ArbiterChan:      server.breachArbiter.newContracts,
-		SendToPeer:       server.SendToPeer,
-		NotifyWhenOnline: server.NotifyWhenOnline,
-		FindPeer:         server.FindPeer,
-		TempChanIDSeed:   chanIDSeed,
-		FindChannel: func(chanID lnwire.ChannelID) (*lnwallet.LightningChannel, error) {
-			dbChannels, err := chanDB.FetchAllChannels()
-			if err != nil {
-				return nil, err
-			}
-
-			for _, channel := range dbChannels {
-				if chanID.IsChanPoint(&channel.FundingOutpoint) {
-					return lnwallet.NewLightningChannel(
-						activeChainControl.signer,
-						activeChainControl.chainNotifier,
-						activeChainControl.feeEstimator,
-						channel)
-				}
-			}
-
-			return nil, fmt.Errorf("unable to find channel")
-		},
-		DefaultRoutingPolicy: activeChainControl.routingPolicy,
-		NumRequiredConfs: func(chanAmt btcutil.Amount, pushAmt lnwire.MilliSatoshi) uint16 {
-			// TODO(roasbeef): add configurable mapping
-			//  * simple switch initially
-			//  * assign coefficient, etc
-			return uint16(cfg.DefaultNumChanConfs)
-		},
-		RequiredRemoteDelay: func(chanAmt btcutil.Amount) uint16 {
-			// TODO(roasbeef): add additional hooks for
-			// configuration
-			return 4
-		},
-	})
-	if err != nil {
-		return err
-	}
-	if err := fundingMgr.Start(); err != nil {
-		return err
-	}
-	server.fundingMgr = fundingMgr
 
 	// Initialize, and register our implementation of the gRPC interface
 	// exported by the rpcServer.
@@ -362,7 +289,7 @@ func lndMain() error {
 	// that we don't accept any possibly invalid state transitions, or
 	// accept channels with spent funds.
 	if !(cfg.Bitcoin.SimNet || cfg.Litecoin.SimNet) {
-		_, bestHeight, err := activeChainControl.chainIO.GetBestBlock()
+		_, bestHeight, err := primaryChainControl.chainIO.GetBestBlock()
 		if err != nil {
 			return err
 		}
@@ -371,7 +298,7 @@ func lndMain() error {
 			"start_height=%v", bestHeight)
 
 		for {
-			synced, err := activeChainControl.wallet.IsSynced()
+			synced, err := primaryChainControl.wallet.IsSynced()
 			if err != nil {
 				return err
 			}
@@ -383,7 +310,7 @@ func lndMain() error {
 			time.Sleep(time.Second * 1)
 		}
 
-		_, bestHeight, err = activeChainControl.chainIO.GetBestBlock()
+		_, bestHeight, err = primaryChainControl.chainIO.GetBestBlock()
 		if err != nil {
 			return err
 		}
@@ -419,7 +346,6 @@ func lndMain() error {
 	addInterruptHandler(func() {
 		ltndLog.Infof("Gracefully shutting down the server...")
 		rpcServer.Stop()
-		fundingMgr.Stop()
 		server.Stop()
 
 		if pilot != nil {
