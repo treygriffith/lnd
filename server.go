@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
@@ -18,6 +19,7 @@ import (
 	"github.com/lightningnetwork/lnd/channeldb"
 	"github.com/lightningnetwork/lnd/discovery"
 	"github.com/lightningnetwork/lnd/lnrpc"
+	"github.com/lightningnetwork/lnd/lnwallet"
 	"github.com/lightningnetwork/lnd/lnwire"
 	"github.com/lightningnetwork/lnd/routing"
 	"github.com/roasbeef/btcd/btcec"
@@ -78,7 +80,8 @@ type server struct {
 	// disconnected.
 	ignorePeerTermination map[*peer]struct{}
 
-	cc *chainControl
+	cc        *chainControl
+	netParams *bitcoinNetParams
 
 	fundingMgr *fundingManager
 
@@ -114,7 +117,7 @@ type server struct {
 
 // newServer creates a new instance of the server which is to listen using the
 // passed listener address.
-func newServer(listenAddrs []string, chanDB *channeldb.DB, cc *chainControl,
+func newServer(listenAddrs []string, chanDB *channeldb.DB, cr *chainRegistry,
 	privKey *btcec.PrivateKey) (*server, error) {
 
 	var err error
@@ -127,12 +130,29 @@ func newServer(listenAddrs []string, chanDB *channeldb.DB, cc *chainControl,
 		}
 	}
 
+	primaryChain := cr.PrimaryChain()
+
+	cc, ok := cr.LookupChain(primaryChain)
+	if !ok {
+		err := fmt.Errorf("unable to find primary chain control: %v", err)
+		srvrLog.Errorf(err.Error())
+		return nil, err
+	}
+
+	netParams, ok := cr.LookupParams(primaryChain)
+	if !ok {
+		err := fmt.Errorf("unable to find primary chain params: %v", err)
+		srvrLog.Errorf(err.Error())
+		return nil, err
+	}
+
 	globalFeatures := lnwire.NewRawFeatureVector()
 
 	serializedPubKey := privKey.PubKey().SerializeCompressed()
 	s := &server{
-		chanDB: chanDB,
-		cc:     cc,
+		chanDB:    chanDB,
+		cc:        cc,
+		netParams: netParams,
 
 		invoices: newInvoiceRegistry(chanDB),
 
@@ -142,7 +162,7 @@ func newServer(listenAddrs []string, chanDB *channeldb.DB, cc *chainControl,
 		// TODO(roasbeef): derive proper onion key based on rotation
 		// schedule
 		sphinx: htlcswitch.NewOnionProcessor(
-			sphinx.NewRouter(privKey, activeNetParams.Params)),
+			sphinx.NewRouter(privKey, netParams.Params)),
 		lightningID: sha256.Sum256(serializedPubKey),
 
 		persistentPeers:       make(map[string]struct{}),
@@ -227,7 +247,7 @@ func newServer(listenAddrs []string, chanDB *channeldb.DB, cc *chainControl,
 		HaveNodeAnnouncement: true,
 		LastUpdate:           time.Now(),
 		Addresses:            selfAddrs,
-		PubKey:               privKey.PubKey(),
+		PubKey:               s.identityPriv.PubKey(),
 		Alias:                alias.String(),
 		Features:             s.globalFeatures,
 	}
@@ -286,10 +306,19 @@ func newServer(listenAddrs []string, chanDB *channeldb.DB, cc *chainControl,
 		return nil, fmt.Errorf("can't create router: %v", err)
 	}
 
+	var chainHashes = make(map[chainhash.Hash]struct{})
+	for _, activeChain := range cr.ActiveChains() {
+		activeNetParams, ok := cr.LookupParams(activeChain)
+		if !ok {
+			return nil, fmt.Errorf("unknown chain code: %v", activeChain)
+		}
+		chainHashes[*activeNetParams.Params.GenesisHash] = struct{}{}
+	}
+
 	s.authGossiper, err = discovery.New(discovery.Config{
 		Router:           s.chanRouter,
 		Notifier:         s.cc.chainNotifier,
-		ChainHash:        *activeNetParams.GenesisHash,
+		ChainHashes:      chainHashes,
 		Broadcast:        s.BroadcastMessage,
 		SendToPeer:       s.SendToPeer,
 		ProofMatureDelta: 0,
@@ -346,6 +375,77 @@ func newServer(listenAddrs []string, chanDB *channeldb.DB, cc *chainControl,
 		Signer:             cc.wallet.Cfg.Signer,
 		Store:              newRetributionStore(chanDB),
 	})
+
+	// Next, we'll initialize the funding manager itself so it can answer
+	// queries while the wallet+chain are still syncing.
+	nodeSigner := newNodeSigner(s.identityPriv)
+	var chanIDSeed [32]byte
+	if _, err := rand.Read(chanIDSeed[:]); err != nil {
+		return nil, err
+	}
+
+	fundingMgr, err := newFundingManager(fundingConfig{
+		IDKey:        s.identityPriv.PubKey(),
+		Wallet:       cc.wallet,
+		Notifier:     cc.chainNotifier,
+		FeeEstimator: cc.feeEstimator,
+		SignMessage: func(pubKey *btcec.PublicKey,
+			msg []byte) (*btcec.Signature, error) {
+
+			if pubKey.IsEqual(s.identityPriv.PubKey()) {
+				return nodeSigner.SignMessage(pubKey, msg)
+			}
+
+			return cc.msgSigner.SignMessage(pubKey, msg)
+		},
+		CurrentNodeAnnouncement: func() (lnwire.NodeAnnouncement, error) {
+			return s.genNodeAnnouncement(true)
+		},
+		SendAnnouncement: func(msg lnwire.Message) error {
+			errChan := s.authGossiper.ProcessLocalAnnouncement(msg,
+				s.identityPriv.PubKey())
+			return <-errChan
+		},
+		ArbiterChan:      s.breachArbiter.newContracts,
+		SendToPeer:       s.SendToPeer,
+		NotifyWhenOnline: s.NotifyWhenOnline,
+		FindPeer:         s.FindPeer,
+		TempChanIDSeed:   chanIDSeed,
+		FindChannel: func(chanID lnwire.ChannelID) (*lnwallet.LightningChannel, error) {
+			dbChannels, err := chanDB.FetchAllChannels()
+			if err != nil {
+				return nil, err
+			}
+
+			for _, channel := range dbChannels {
+				if chanID.IsChanPoint(&channel.FundingOutpoint) {
+					return lnwallet.NewLightningChannel(
+						cc.signer,
+						cc.chainNotifier,
+						cc.feeEstimator,
+						channel)
+				}
+			}
+
+			return nil, fmt.Errorf("unable to find channel")
+		},
+		DefaultRoutingPolicy: cc.routingPolicy,
+		NumRequiredConfs: func(chanAmt btcutil.Amount, pushAmt lnwire.MilliSatoshi) uint16 {
+			// TODO(roasbeef): add configurable mapping
+			//  * simple switch initially
+			//  * assign coefficient, etc
+			return uint16(cfg.DefaultNumChanConfs)
+		},
+		RequiredRemoteDelay: func(chanAmt btcutil.Amount) uint16 {
+			// TODO(roasbeef): add additional hooks for
+			// configuration
+			return 4
+		},
+	})
+	if err != nil {
+		return nil, err
+	}
+	s.fundingMgr = fundingMgr
 
 	// Create the connection manager which will be responsible for
 	// maintaining persistent outbound connections and also accepting new
@@ -406,6 +506,9 @@ func (s *server) Start() error {
 	if err := s.chanRouter.Start(); err != nil {
 		return err
 	}
+	if err := s.fundingMgr.Start(); err != nil {
+		return err
+	}
 
 	// With all the relevant sub-systems started, we'll now attempt to
 	// establish persistent connections to our direct channel collaborators
@@ -452,6 +555,7 @@ func (s *server) Stop() error {
 	s.utxoNursery.Stop()
 	s.breachArbiter.Stop()
 	s.authGossiper.Stop()
+	s.fundingMgr.Stop()
 	s.cc.wallet.Shutdown()
 	s.cc.chainView.Stop()
 	s.connMgr.Stop()
@@ -1593,7 +1697,7 @@ func (s *server) OpenChannel(peerID int32, nodeKey *btcec.PublicKey,
 	req := &openChanReq{
 		targetPeerID:    peerID,
 		targetPubkey:    nodeKey,
-		chainHash:       *activeNetParams.GenesisHash,
+		chainHash:       *s.netParams.GenesisHash,
 		localFundingAmt: localAmt,
 		pushAmt:         pushAmt,
 		updates:         updateChan,
