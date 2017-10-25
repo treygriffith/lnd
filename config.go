@@ -219,22 +219,24 @@ func loadConfig() (*config, error) {
 		return nil, err
 	}
 
-	switch {
 	// The SPV mode implemented currently doesn't support Litecoin, so the
 	// two modes are incompatible.
-	case cfg.NeutrinoMode.Active && cfg.Litecoin.Active:
+	if cfg.NeutrinoMode.Active && cfg.Litecoin.Active {
 		str := "%s: The light client mode currently supported does " +
 			"not yet support execution on the Litecoin network"
 		err := fmt.Errorf(str, funcName)
 		return nil, err
+	}
 
 	// Either Bitcoin must be active, or Litecoin must be active.
 	// Otherwise, we don't know which chain we're on.
-	case !cfg.Bitcoin.Active && !cfg.Litecoin.Active:
+	if !cfg.Bitcoin.Active && !cfg.Litecoin.Active {
 		return nil, fmt.Errorf("either bitcoin.active or " +
 			"litecoin.active must be set to 1 (true)")
+	}
 
-	case cfg.Litecoin.Active:
+	var netParams = make(map[chainCode]bitcoinNetParams)
+	if cfg.Litecoin.Active {
 		if cfg.Litecoin.SimNet {
 			str := "%s: simnet mode for litecoin not currently supported"
 			return nil, fmt.Errorf(str, funcName)
@@ -244,9 +246,12 @@ func loadConfig() (*config, error) {
 		// throughout the codebase we required chiancfg.Params. So as a
 		// temporary hack, we'll mutate the default net params for
 		// bitcoin with the litecoin specific information.
-		paramCopy := bitcoinTestNetParams
-		applyLitecoinParams(&paramCopy)
-		activeNetParams = paramCopy
+		var ltcParams = bitcoinTestNetParams
+		applyLitecoinParams(&ltcParams)
+
+		// Add the ltc params to the list of network parameters
+		netParams[litecoinChain] = ltcParams
+		registeredChains.RegisterParams(litecoinChain, &ltcParams)
 
 		if !cfg.NeutrinoMode.Active {
 			// Attempt to parse out the RPC credentials for the
@@ -261,26 +266,31 @@ func loadConfig() (*config, error) {
 
 		cfg.Litecoin.ChainDir = filepath.Join(cfg.DataDir, litecoinChain.String())
 
-		// Finally we'll register the litecoin chain as our current
-		// primary chain.
-		registeredChains.RegisterPrimaryChain(litecoinChain)
+		if !cfg.Bitcoin.Active {
+			// Finally we'll register the litecoin chain as our current
+			// primary chain if bitcoin is not active.
+			registeredChains.RegisterPrimaryChain(litecoinChain)
+		}
+	}
 
-	case cfg.Bitcoin.Active:
+	if cfg.Bitcoin.Active {
+		var btcParams bitcoinNetParams
+
 		// Multiple networks can't be selected simultaneously.  Count
 		// number of network flags passed; assign active network params
 		// while we're at it.
 		numNets := 0
 		if cfg.Bitcoin.TestNet3 {
 			numNets++
-			activeNetParams = bitcoinTestNetParams
+			btcParams = bitcoinTestNetParams
 		}
 		if cfg.Bitcoin.RegTest {
 			numNets++
-			activeNetParams = regTestNetParams
+			btcParams = regTestNetParams
 		}
 		if cfg.Bitcoin.SimNet {
 			numNets++
-			activeNetParams = bitcoinSimNetParams
+			btcParams = bitcoinSimNetParams
 		}
 		if numNets > 1 {
 			str := "%s: The testnet, segnet, and simnet params can't be " +
@@ -288,6 +298,10 @@ func loadConfig() (*config, error) {
 			err := fmt.Errorf(str, funcName)
 			return nil, err
 		}
+
+		// Add the btc net params to the list of network parameters.
+		netParams[bitcoinChain] = btcParams
+		registeredChains.RegisterParams(bitcoinChain, &btcParams)
 
 		if !cfg.NeutrinoMode.Active {
 			// If needed, we'll attempt to automatically configure
@@ -306,6 +320,9 @@ func loadConfig() (*config, error) {
 		// primary chain.
 		registeredChains.RegisterPrimaryChain(bitcoinChain)
 	}
+
+	fmt.Printf("Primary chain is set to: %v\n",
+		registeredChains.PrimaryChain())
 
 	// Validate profile port number.
 	if cfg.Profile != "" {
@@ -334,6 +351,15 @@ func loadConfig() (*config, error) {
 		cfg.ReadMacPath = filepath.Join(cfg.DataDir, defaultReadMacFilename)
 	}
 
+	primaryChain := registeredChains.PrimaryChain()
+	primaryParams, ok := registeredChains.LookupParams(primaryChain)
+	if !ok {
+		err := fmt.Errorf("unable to find primary network params for "+
+			"active chain: %v", primaryChain)
+		ltndLog.Errorf(err.Error())
+		return nil, err
+	}
+
 	// Append the network type to the data directory so it is "namespaced"
 	// per network. In addition to the block database, there are other
 	// pieces of data that are saved to disk such as address manager state.
@@ -343,16 +369,12 @@ func loadConfig() (*config, error) {
 	// TODO(roasbeef): when we go full multi-chain remove the additional
 	// namespacing on the target chain.
 	cfg.DataDir = cleanAndExpandPath(cfg.DataDir)
-	cfg.DataDir = filepath.Join(cfg.DataDir, activeNetParams.Name)
-	cfg.DataDir = filepath.Join(cfg.DataDir,
-		registeredChains.primaryChain.String())
+	cfg.DataDir = filepath.Join(cfg.DataDir, primaryParams.Name)
 
 	// Append the network type to the log directory so it is "namespaced"
 	// per network in the same fashion as the data directory.
 	cfg.LogDir = cleanAndExpandPath(cfg.LogDir)
-	cfg.LogDir = filepath.Join(cfg.LogDir, activeNetParams.Name)
-	cfg.LogDir = filepath.Join(cfg.LogDir,
-		registeredChains.primaryChain.String())
+	cfg.LogDir = filepath.Join(cfg.LogDir, primaryParams.Name)
 
 	// Ensure that the paths to the TLS key and certificate files are
 	// expanded and cleaned.
