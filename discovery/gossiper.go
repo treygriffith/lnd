@@ -51,7 +51,7 @@ type Config struct {
 	// TODO(roasbeef): eventually make into map so can de-multiplex
 	// incoming announcements
 	//   * also need to do same for Notifier
-	ChainHash chainhash.Hash
+	ChainHashes map[chainhash.Hash]struct{}
 
 	// Router is the subsystem which is responsible for managing the
 	// topology of lightning network. After incoming channel, node, channel
@@ -734,10 +734,10 @@ func (d *AuthenticatedGossiper) processNetworkAnnouncement(nMsg *networkMsg) []l
 	case *lnwire.ChannelAnnouncement:
 		// We'll ignore any channel announcements that target any chain
 		// other than the set of chains we know of.
-		if !bytes.Equal(msg.ChainHash[:], d.cfg.ChainHash[:]) {
-			log.Error("Ignoring ChannelAnnouncement from "+
-				"chain=%v, gossiper on chain=%v", msg.ChainHash,
-				d.cfg.ChainHash)
+		if _, ok := d.cfg.ChainHashes[msg.ChainHash]; !ok {
+			log.Errorf("Ignoring ChannelAnnouncement from "+
+				"chain=%v, gossiper on %d other chains", msg.ChainHash,
+				len(d.cfg.ChainHashes))
 			return nil
 		}
 
@@ -838,10 +838,10 @@ func (d *AuthenticatedGossiper) processNetworkAnnouncement(nMsg *networkMsg) []l
 	case *lnwire.ChannelUpdate:
 		// We'll ignore any channel announcements that target any chain
 		// other than the set of chains we know of.
-		if !bytes.Equal(msg.ChainHash[:], d.cfg.ChainHash[:]) {
-			log.Error("Ignoring ChannelUpdate from "+
-				"chain=%v, gossiper on chain=%v", msg.ChainHash,
-				d.cfg.ChainHash)
+		if _, ok := d.cfg.ChainHashes[msg.ChainHash]; !ok {
+			log.Errorf("Ignoring ChannelUpdate from "+
+				"chain=%v, gossiper on %d other chain", msg.ChainHash,
+				len(d.cfg.ChainHashes))
 			return nil
 		}
 
