@@ -102,7 +102,8 @@ type chainControl struct {
 // according to the parameters in the passed lnd configuration. Currently two
 // branches of chainControl instances exist: one backed by a running btcd
 // full-node, and the other backed by a running neutrino light client instance.
-func newChainControlFromConfig(cfg *config, chanDB *channeldb.DB) (func(), error) {
+func newChainControlFromConfig(cfg *config, chanDB *channeldb.DB,
+	privateWalletPw, publicWalletPw []byte) (func(), error) {
 
 	activeChains := registeredChains.ActiveChains()
 
@@ -145,7 +146,8 @@ func newChainControlFromConfig(cfg *config, chanDB *channeldb.DB) (func(), error
 		}
 
 		walletConfig := &btcwallet.Config{
-			PrivatePass:  []byte("hello"),
+			PrivatePass:  privateWalletPw,
+			PublicPass:   publicWalletPw,
 			DataDir:      chainConf.ChainDir,
 			NetParams:    netParams.Params,
 			FeeEstimator: cc.feeEstimator,
@@ -259,6 +261,7 @@ func newChainControlFromConfig(cfg *config, chanDB *channeldb.DB) (func(), error
 
 			// Finally, we'll create an instance of the default
 			// chain view to be used within the routing layer.
+			cc.chainView, err = chainview.NewBtcdFilteredChainView(*rpcConfig)
 			if err != nil {
 				srvrLog.Errorf("unable to create chain view: "+
 					"%v", err)
@@ -401,14 +404,16 @@ func newChainRegistry() *chainRegistry {
 // identified by its chainCode.
 func (c *chainRegistry) RegisterChain(newChain chainCode, cc *chainControl) {
 	c.Lock()
+	defer c.Unlock()
+
 	c.activeChains[newChain] = cc
-	c.Unlock()
 }
 
 func (c *chainRegistry) RegisterParams(newChain chainCode, p *bitcoinNetParams) {
 	c.Lock()
+	defer c.Unlock()
+
 	c.netParams[newChain] = p
-	c.Unlock()
 }
 
 // LookupChain attempts to lookup an active chainControl instance for the
@@ -417,6 +422,7 @@ func (c *chainRegistry) LookupChain(targetChain chainCode) (*chainControl, bool)
 	c.RLock()
 	cc, ok := c.activeChains[targetChain]
 	c.RUnlock()
+
 	return cc, ok
 }
 
@@ -424,6 +430,7 @@ func (c *chainRegistry) LookupParams(targetChain chainCode) (*bitcoinNetParams, 
 	c.RLock()
 	params, ok := c.netParams[targetChain]
 	c.RUnlock()
+
 	return params, ok
 }
 
@@ -465,8 +472,8 @@ func (c *chainRegistry) ActiveChains() []chainCode {
 	c.RLock()
 	defer c.RUnlock()
 
-	chains := make([]chainCode, 0, len(c.activeChains))
-	for activeChain := range c.activeChains {
+	chains := make([]chainCode, 0, len(c.netParams))
+	for activeChain := range c.netParams {
 		chains = append(chains, activeChain)
 	}
 
