@@ -33,6 +33,7 @@ import (
 	"github.com/lightningnetwork/lnd/channeldb"
 	"github.com/lightningnetwork/lnd/lnrpc"
 	"github.com/lightningnetwork/lnd/macaroons"
+	"github.com/lightningnetwork/lnd/realm"
 	"github.com/lightningnetwork/lnd/walletunlocker"
 	"github.com/roasbeef/btcd/btcec"
 )
@@ -43,9 +44,9 @@ const (
 )
 
 var (
-	cfg              *config
-	shutdownChannel  = make(chan struct{})
-	registeredChains = newChainRegistry()
+	cfg             *config
+	shutdownChannel = make(chan struct{})
+	universe        = realm.NewUniverse()
 
 	macaroonDatabaseDir string
 
@@ -215,15 +216,15 @@ func lndMain() error {
 	// Finally before we start the server, we'll register the "holy
 	// trinity" of interface for our current "home chain" with the active
 	// chainRegistry interface.
-	primaryChain := registeredChains.PrimaryChain()
-	primaryChainControl, ok := registeredChains.LookupChain(primaryChain)
-	if !ok {
+	primaryChain := universe.PrimaryRealm()
+	primaryChainControl, err := universe.Control(primaryChain)
+	if err != nil {
 		err := fmt.Errorf("unable to find primary chain control: %v", err)
 		ltndLog.Errorf(err.Error())
 		return err
 	}
 
-	idPrivKey, err := primaryChainControl.wallet.GetIdentitykey()
+	idPrivKey, err := primaryChainControl.Wallet.GetIdentitykey()
 	if err != nil {
 		return err
 	}
@@ -234,10 +235,14 @@ func lndMain() error {
 	defaultListenAddrs := []string{
 		net.JoinHostPort("", strconv.Itoa(cfg.PeerPort)),
 	}
-	server, err := newServer(defaultListenAddrs, chanDB, registeredChains,
+	server, err := newServer(defaultListenAddrs, chanDB, universe,
 		idPrivKey)
 	if err != nil {
 		srvrLog.Errorf("unable to create server: %v\n", err)
+		return err
+	}
+
+	if err := server.services.StartFunding(); err != nil {
 		return err
 	}
 
@@ -289,7 +294,7 @@ func lndMain() error {
 	// that we don't accept any possibly invalid state transitions, or
 	// accept channels with spent funds.
 	if !(cfg.Bitcoin.SimNet || cfg.Litecoin.SimNet) {
-		_, bestHeight, err := primaryChainControl.chainIO.GetBestBlock()
+		_, bestHeight, err := primaryChainControl.ChainIO.GetBestBlock()
 		if err != nil {
 			return err
 		}
@@ -298,7 +303,7 @@ func lndMain() error {
 			"start_height=%v", bestHeight)
 
 		for {
-			synced, err := primaryChainControl.wallet.IsSynced()
+			synced, err := primaryChainControl.Wallet.IsSynced()
 			if err != nil {
 				return err
 			}
@@ -310,7 +315,7 @@ func lndMain() error {
 			time.Sleep(time.Second * 1)
 		}
 
-		_, bestHeight, err = primaryChainControl.chainIO.GetBestBlock()
+		_, bestHeight, err = primaryChainControl.ChainIO.GetBestBlock()
 		if err != nil {
 			return err
 		}
@@ -559,11 +564,11 @@ func waitForWalletPassword(grpcEndpoint, restEndpoint string,
 	grpcServer := grpc.NewServer(serverOpts...)
 
 	chainConfig := cfg.Bitcoin
-	if registeredChains.PrimaryChain() == litecoinChain {
+	if universe.PrimaryRealm() == realm.LTC {
 		chainConfig = cfg.Litecoin
 	}
 	pwService := walletunlocker.New(macaroonService,
-		chainConfig.ChainDir, activeNetParams.Params)
+		chainConfig.ChainDir, bitcoinTestNetParams.Params)
 	lnrpc.RegisterWalletUnlockerServer(grpcServer, pwService)
 
 	// Start a gRPC server listening for HTTP/2 connections, solely
