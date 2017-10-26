@@ -2,6 +2,7 @@ package routing
 
 import (
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"math"
 
@@ -14,6 +15,10 @@ import (
 	"github.com/roasbeef/btcd/btcec"
 	"github.com/roasbeef/btcd/chaincfg/chainhash"
 	"github.com/roasbeef/btcutil"
+)
+
+var (
+	ErrUnknownNextRealm = errors.New("unknown realm for chain hash")
 )
 
 const (
@@ -137,6 +142,10 @@ type Route struct {
 	// off to. With this map, we can easily look up the next outgoing
 	// channel or node for pruning purposes.
 	nextHopMap map[vertex]*ChannelHop
+
+	// chainRealmMap maps a chain hash to the realm byte used in the onion
+	// packets.
+	chainRealmMap map[chainhash.Hash]byte
 }
 
 // nextHopVertex returns the next hop (by vertex) after the target node. If the
@@ -171,17 +180,23 @@ func (r *Route) containsChannel(chanID uint64) bool {
 
 // ToHopPayloads converts a complete route into the series of per-hop payloads
 // that is to be encoded within each HTLC using an opaque Sphinx packet.
-func (r *Route) ToHopPayloads() []sphinx.HopData {
+func (r *Route) ToHopPayloads() ([]sphinx.HopData, error) {
 	hopPayloads := make([]sphinx.HopData, len(r.Hops))
 
 	// For each hop encoded within the route, we'll convert the hop struct
 	// to the matching per-hop payload struct as used by the sphinx
 	// package.
 	for i, hop := range r.Hops {
+		log.Infof("forwarding to chain: %v", hop.Channel.Chain)
+		realmByte, ok := r.chainRealmMap[hop.Channel.Chain]
+		if !ok {
+			return nil, ErrUnknownNextRealm
+		}
+
 		hopPayloads[i] = sphinx.HopData{
 			// TODO(roasbeef): properly set realm, make sphinx type
 			// an enum actually?
-			Realm:         0,
+			Realm:         realmByte,
 			ForwardAmount: uint64(hop.AmtToForward),
 			OutgoingCltv:  hop.OutgoingTimeLock,
 		}
@@ -200,7 +215,7 @@ func (r *Route) ToHopPayloads() []sphinx.HopData {
 			nextHop)
 	}
 
-	return hopPayloads
+	return hopPayloads, nil
 }
 
 // newRoute returns a fully valid route between the source and target that's
@@ -211,8 +226,8 @@ func (r *Route) ToHopPayloads() []sphinx.HopData {
 // NOTE: The passed slice of ChannelHops MUST be sorted in forward order: from
 // the source to the target node of the path finding attempt.
 func newRoute(amtToSend lnwire.MilliSatoshi, sourceVertex vertex,
-	pathEdges []*ChannelHop, currentHeight uint32,
-	finalCLTVDelta uint16) (*Route, error) {
+	pathEdges []*ChannelHop, currentHeight uint32, finalCLTVDelta uint16,
+	chainRealmMap map[chainhash.Hash]byte) (*Route, error) {
 
 	// First, we'll create a new empty route with enough hops to match the
 	// amount of path edges. We set the TotalTimeLock to the current block
@@ -224,7 +239,10 @@ func newRoute(amtToSend lnwire.MilliSatoshi, sourceVertex vertex,
 		nodeIndex:     make(map[vertex]struct{}),
 		chanIndex:     make(map[uint64]struct{}),
 		nextHopMap:    make(map[vertex]*ChannelHop),
+		chainRealmMap: chainRealmMap,
 	}
+
+	log.Infof("chain realm map: %v", chainRealmMap)
 
 	// TODO(roasbeef): need to do sanity check to ensure we don't make a
 	// "dust" payment: over x% of money sending to fees
@@ -509,6 +527,7 @@ func findPath(tx *bolt.Tx, graph *channeldb.ChannelGraph,
 					edge: &ChannelHop{
 						ChannelEdgePolicy: outEdge,
 						Capacity:          edgeInfo.Capacity,
+						Chain:             edgeInfo.ChainHash,
 					},
 					prevNode: bestNode.PubKey,
 				}
