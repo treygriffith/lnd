@@ -81,7 +81,7 @@ func (m *mockNotfier) RegisterSpendNtfn(outpoint *wire.OutPoint,
 type mockChainIO struct{}
 
 func (*mockChainIO) GetBestBlock() (*chainhash.Hash, int32, error) {
-	return activeNetParams.GenesisHash, fundingBroadcastHeight, nil
+	return bitcoinSimNetParams.GenesisHash, fundingBroadcastHeight, nil
 }
 
 func (*mockChainIO) GetUtxo(op *wire.OutPoint,
