@@ -160,7 +160,7 @@ func createTestWallet(cdb *channeldb.DB, netParams *chaincfg.Params,
 func createTestFundingManager(t *testing.T, privKey *btcec.PrivateKey,
 	tempTestDir string) (*testNode, error) {
 
-	netParams := activeNetParams.Params
+	netParams := bitcoinSimNetParams.Params
 	estimator := lnwallet.StaticFeeEstimator{FeeRate: 250}
 
 	chainNotifier := &mockNotifier{
@@ -404,7 +404,7 @@ func openChannel(t *testing.T, alice, bob *testNode, localFundingAmt,
 	initReq := &openChanReq{
 		targetPeerID:    int32(1),
 		targetPubkey:    bob.privKey.PubKey(),
-		chainHash:       *activeNetParams.GenesisHash,
+		chainHash:       *bitcoinSimNetParams.GenesisHash,
 		localFundingAmt: localFundingAmt,
 		pushAmt:         lnwire.NewMSatFromSatoshis(pushAmt),
 		updates:         updateChan,
