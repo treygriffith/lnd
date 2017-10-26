@@ -15,6 +15,7 @@ import (
 	flags "github.com/btcsuite/go-flags"
 	"github.com/lightningnetwork/lnd/brontide"
 	"github.com/lightningnetwork/lnd/lnwire"
+	"github.com/lightningnetwork/lnd/realm"
 	"github.com/roasbeef/btcd/btcec"
 	"github.com/roasbeef/btcutil"
 )
@@ -235,28 +236,22 @@ func loadConfig() (*config, error) {
 			"litecoin.active must be set to 1 (true)")
 	}
 
-	var netParams = make(map[chainCode]bitcoinNetParams)
 	if cfg.Litecoin.Active {
 		if cfg.Litecoin.SimNet {
 			str := "%s: simnet mode for litecoin not currently supported"
 			return nil, fmt.Errorf(str, funcName)
 		}
 
-		// The litecoin chain is the current active chain. However
-		// throughout the codebase we required chiancfg.Params. So as a
-		// temporary hack, we'll mutate the default net params for
-		// bitcoin with the litecoin specific information.
-		var ltcParams = bitcoinTestNetParams
-		applyLitecoinParams(&ltcParams)
-
 		// Add the ltc params to the list of network parameters
-		netParams[litecoinChain] = ltcParams
-		registeredChains.RegisterParams(litecoinChain, &ltcParams)
+		err := universe.RegisterParam(realm.LTC, &liteTestNetParams)
+		if err != nil {
+			return nil, err
+		}
 
 		if !cfg.NeutrinoMode.Active {
 			// Attempt to parse out the RPC credentials for the
 			// litecoin chain if the information wasn't specified
-			err := parseRPCParams(cfg.Litecoin, litecoinChain, funcName)
+			err := parseRPCParams(cfg.Litecoin, realm.LTC, funcName)
 			if err != nil {
 				err := fmt.Errorf("unable to load RPC credentials for "+
 					"ltcd: %v", err)
@@ -264,17 +259,17 @@ func loadConfig() (*config, error) {
 			}
 		}
 
-		cfg.Litecoin.ChainDir = filepath.Join(cfg.DataDir, litecoinChain.String())
+		cfg.Litecoin.ChainDir = filepath.Join(cfg.DataDir, realm.LTC.String())
 
 		if !cfg.Bitcoin.Active {
 			// Finally we'll register the litecoin chain as our current
 			// primary chain if bitcoin is not active.
-			registeredChains.RegisterPrimaryChain(litecoinChain)
+			universe.SetPrimaryRealm(realm.LTC)
 		}
 	}
 
 	if cfg.Bitcoin.Active {
-		var btcParams bitcoinNetParams
+		var btcParams realm.Params
 
 		// Multiple networks can't be selected simultaneously.  Count
 		// number of network flags passed; assign active network params
@@ -300,13 +295,12 @@ func loadConfig() (*config, error) {
 		}
 
 		// Add the btc net params to the list of network parameters.
-		netParams[bitcoinChain] = btcParams
-		registeredChains.RegisterParams(bitcoinChain, &btcParams)
+		universe.RegisterParam(realm.BTC, &btcParams)
 
 		if !cfg.NeutrinoMode.Active {
 			// If needed, we'll attempt to automatically configure
 			// the RPC control plan for the target btcd node.
-			err := parseRPCParams(cfg.Bitcoin, bitcoinChain, funcName)
+			err := parseRPCParams(cfg.Bitcoin, realm.BTC, funcName)
 			if err != nil {
 				err := fmt.Errorf("unable to load RPC credentials for "+
 					"btcd: %v", err)
@@ -314,15 +308,14 @@ func loadConfig() (*config, error) {
 			}
 		}
 
-		cfg.Bitcoin.ChainDir = filepath.Join(cfg.DataDir, bitcoinChain.String())
+		cfg.Bitcoin.ChainDir = filepath.Join(cfg.DataDir, realm.BTC.String())
 
 		// Finally we'll register the bitcoin chain as our current
 		// primary chain.
-		registeredChains.RegisterPrimaryChain(bitcoinChain)
+		universe.SetPrimaryRealm(realm.BTC)
 	}
 
-	fmt.Printf("Primary chain is set to: %v\n",
-		registeredChains.PrimaryChain())
+	fmt.Printf("Primary chain is set to: %v\n", universe.PrimaryRealm())
 
 	// Validate profile port number.
 	if cfg.Profile != "" {
@@ -351,9 +344,9 @@ func loadConfig() (*config, error) {
 		cfg.ReadMacPath = filepath.Join(cfg.DataDir, defaultReadMacFilename)
 	}
 
-	primaryChain := registeredChains.PrimaryChain()
-	primaryParams, ok := registeredChains.LookupParams(primaryChain)
-	if !ok {
+	primaryChain := universe.PrimaryRealm()
+	primaryParams, err := universe.Param(primaryChain)
+	if err != nil {
 		err := fmt.Errorf("unable to find primary network params for "+
 			"active chain: %v", primaryChain)
 		ltndLog.Errorf(err.Error())
@@ -510,7 +503,7 @@ func noiseDial(idPriv *btcec.PrivateKey) func(net.Addr) (net.Conn, error) {
 	}
 }
 
-func parseRPCParams(cConfig *chainConfig, net chainCode, funcName string) error {
+func parseRPCParams(cConfig *chainConfig, net realm.Code, funcName string) error {
 	// If the rpcuser and rpcpass parameters aren't set, then we'll attempt
 	// to automatically obtain the proper credentials for btcd and set
 	// them within the configuration.
@@ -528,13 +521,13 @@ func parseRPCParams(cConfig *chainConfig, net chainCode, funcName string) error 
 	}
 
 	daemonName := "btcd"
-	if net == litecoinChain {
+	if net == realm.LTC {
 		daemonName = "ltcd"
 	}
 	fmt.Println("Attempting automatic RPC configuration to " + daemonName)
 
 	homeDir := btcdHomeDir
-	if net == litecoinChain {
+	if net == realm.LTC {
 		homeDir = ltcdHomeDir
 	}
 	confFile := filepath.Join(homeDir, fmt.Sprintf("%v.conf", daemonName))
