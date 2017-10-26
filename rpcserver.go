@@ -26,6 +26,7 @@ import (
 	"github.com/lightningnetwork/lnd/lnwallet"
 	"github.com/lightningnetwork/lnd/lnwire"
 	"github.com/lightningnetwork/lnd/macaroons"
+	"github.com/lightningnetwork/lnd/realm"
 	"github.com/lightningnetwork/lnd/routing"
 	"github.com/lightningnetwork/lnd/zpay32"
 	"github.com/roasbeef/btcd/blockchain"
@@ -39,6 +40,8 @@ import (
 	"github.com/tv42/zbase32"
 	"golang.org/x/net/context"
 )
+
+var ticker = "BTC"
 
 var (
 	defaultAccount uint32 = waddrmgr.DefaultAccountNum
@@ -125,10 +128,10 @@ func (r *rpcServer) Stop() error {
 // the outputs themselves. The passed map pairs up an address, to a desired
 // output value amount. Each address is converted to its corresponding pkScript
 // to be used within the constructed output(s).
-func addrPairsToOutputs(addrPairs map[string]int64) ([]*wire.TxOut, error) {
+func addrPairsToOutputs(params *realm.Params, addrPairs map[string]int64) ([]*wire.TxOut, error) {
 	outputs := make([]*wire.TxOut, 0, len(addrPairs))
 	for addr, amt := range addrPairs {
-		addr, err := btcutil.DecodeAddress(addr, activeNetParams.Params)
+		addr, err := btcutil.DecodeAddress(addr, params.Params)
 		if err != nil {
 			return nil, err
 		}
@@ -147,13 +150,20 @@ func addrPairsToOutputs(addrPairs map[string]int64) ([]*wire.TxOut, error) {
 // sendCoinsOnChain makes an on-chain transaction in or to send coins to one or
 // more addresses specified in the passed payment map. The payment map maps an
 // address to a specified output value to be sent to that address.
-func (r *rpcServer) sendCoinsOnChain(paymentMap map[string]int64) (*chainhash.Hash, error) {
-	outputs, err := addrPairsToOutputs(paymentMap)
+func (r *rpcServer) sendCoinsOnChain(ticker string,
+	paymentMap map[string]int64) (*chainhash.Hash, error) {
+
+	cs, err := r.server.services.ByTicker(ticker)
 	if err != nil {
 		return nil, err
 	}
 
-	return r.server.cc.wallet.SendOutputs(outputs)
+	outputs, err := addrPairsToOutputs(cs.params, paymentMap)
+	if err != nil {
+		return nil, err
+	}
+
+	return cs.cc.Wallet.SendOutputs(outputs)
 }
 
 // SendCoins executes a request to send coins to a particular address. Unlike
@@ -172,7 +182,7 @@ func (r *rpcServer) SendCoins(ctx context.Context,
 	rpcsLog.Infof("[sendcoins] addr=%v, amt=%v", in.Addr, btcutil.Amount(in.Amount))
 
 	paymentMap := map[string]int64{in.Addr: in.Amount}
-	txid, err := r.sendCoinsOnChain(paymentMap)
+	txid, err := r.sendCoinsOnChain(ticker, paymentMap)
 	if err != nil {
 		return nil, err
 	}
@@ -195,7 +205,7 @@ func (r *rpcServer) SendMany(ctx context.Context,
 		}
 	}
 
-	txid, err := r.sendCoinsOnChain(in.AddrToAmount)
+	txid, err := r.sendCoinsOnChain(ticker, in.AddrToAmount)
 	if err != nil {
 		return nil, err
 	}
@@ -229,7 +239,12 @@ func (r *rpcServer) NewAddress(ctx context.Context,
 		addrType = lnwallet.PubKeyHash
 	}
 
-	addr, err := r.server.cc.wallet.NewAddress(addrType, false)
+	cs, err := r.server.services.ByTicker(ticker)
+	if err != nil {
+		return nil, err
+	}
+
+	addr, err := cs.cc.Wallet.NewAddress(addrType, false)
 	if err != nil {
 		return nil, err
 	}
@@ -251,9 +266,13 @@ func (r *rpcServer) NewWitnessAddress(ctx context.Context,
 		}
 	}
 
-	addr, err := r.server.cc.wallet.NewAddress(
-		lnwallet.NestedWitnessPubKey, false,
-	)
+	cs, err := r.server.services.ByTicker(ticker)
+	if err != nil {
+		return nil, err
+	}
+
+	addr, err := cs.cc.Wallet.NewAddress(
+		lnwallet.NestedWitnessPubKey, false)
 	if err != nil {
 		return nil, err
 	}
@@ -395,7 +414,6 @@ func (r *rpcServer) ConnectPeer(ctx context.Context,
 	peerAddr := &lnwire.NetAddress{
 		IdentityKey: pubKey,
 		Address:     host,
-		ChainNet:    activeNetParams.Net,
 	}
 
 	if err := r.server.ConnectToPeer(peerAddr, in.Perm); err != nil {
@@ -553,6 +571,7 @@ func (r *rpcServer) OpenChannel(in *lnrpc.OpenChannelRequest,
 	updateChan, errChan := r.server.OpenChannel(
 		in.TargetPeerId, nodePubKey, localFundingAmt,
 		lnwire.NewMSatFromSatoshis(remoteInitialBalance),
+		ticker,
 	)
 
 	var outpoint wire.OutPoint
@@ -622,9 +641,14 @@ func (r *rpcServer) OpenChannelSync(ctx context.Context,
 			"not active yet")
 	}
 
+	cs, err := r.server.services.ByTicker(ticker)
+	if err != nil {
+		return nil, err
+	}
+
 	// Creation of channels before the wallet syncs up is currently
 	// disallowed.
-	isSynced, err := r.server.cc.wallet.IsSynced()
+	isSynced, err := cs.cc.Wallet.IsSynced()
 	if err != nil {
 		return nil, err
 	}
@@ -659,6 +683,7 @@ func (r *rpcServer) OpenChannelSync(ctx context.Context,
 	updateChan, errChan := r.server.OpenChannel(
 		in.TargetPeerId, nodepubKey, localFundingAmt,
 		lnwire.NewMSatFromSatoshis(remoteInitialBalance),
+		ticker,
 	)
 
 	select {
@@ -736,7 +761,12 @@ func (r *rpcServer) CloseChannel(in *lnrpc.CloseChannelRequest,
 		}
 		defer channel.Stop()
 
-		_, bestHeight, err := r.server.cc.chainIO.GetBestBlock()
+		cs, err := r.server.services.ByHash(channel.ChainHash())
+		if err != nil {
+			return err
+		}
+
+		_, bestHeight, err := cs.cc.ChainIO.GetBestBlock()
 		if err != nil {
 			return err
 		}
@@ -757,7 +787,7 @@ func (r *rpcServer) CloseChannel(in *lnrpc.CloseChannelRequest,
 		}
 
 		select {
-		case r.server.breachArbiter.settledContracts <- chanPoint:
+		case cs.breachArbiter.settledContracts <- chanPoint:
 		case <-r.quit:
 			return fmt.Errorf("server shutting down")
 		}
@@ -782,7 +812,7 @@ func (r *rpcServer) CloseChannel(in *lnrpc.CloseChannelRequest,
 		}
 
 		errChan = make(chan error, 1)
-		notifier := r.server.cc.chainNotifier
+		notifier := cs.cc.ChainNotifier
 		go waitForChanToClose(uint32(bestHeight), notifier, errChan, chanPoint,
 			closingTxid, func() {
 				// Respond to the local subsystem which
@@ -874,10 +904,15 @@ func (r *rpcServer) fetchActiveChannel(chanPoint wire.OutPoint) (*lnwallet.Light
 		return nil, fmt.Errorf("unable to find channel")
 	}
 
+	cs, err := r.server.services.ByHash(&dbChan.ChainHash)
+	if err != nil {
+		return nil, err
+	}
+
 	// Otherwise, we create a fully populated channel state machine which
 	// uses the db channel as backing storage.
-	return lnwallet.NewLightningChannel(r.server.cc.wallet.Cfg.Signer, nil,
-		r.server.cc.feeEstimator, dbChan)
+	return lnwallet.NewLightningChannel(cs.cc.Wallet.Cfg.Signer, nil,
+		cs.cc.FeeEstimator, dbChan)
 }
 
 // forceCloseChan executes a unilateral close of the target channel by
@@ -886,6 +921,11 @@ func (r *rpcServer) fetchActiveChannel(chanPoint wire.OutPoint) (*lnwallet.Light
 // state of the channel is sent to the utxoNursery in order to ultimately sweep
 // the immature outputs.
 func (r *rpcServer) forceCloseChan(channel *lnwallet.LightningChannel) (*chainhash.Hash, *lnwallet.ForceCloseSummary, error) {
+
+	cs, err := r.server.services.ByHash(channel.ChainHash())
+	if err != nil {
+		return nil, nil, err
+	}
 
 	// Execute a unilateral close shutting down all further channel
 	// operation.
@@ -903,7 +943,7 @@ func (r *rpcServer) forceCloseChan(channel *lnwallet.LightningChannel) (*chainha
 		channel.ChannelPoint(), newLogClosure(func() string {
 			return spew.Sdump(closeTx)
 		}))
-	if err := r.server.cc.wallet.PublishTransaction(closeTx); err != nil {
+	if err := cs.cc.Wallet.PublishTransaction(closeTx); err != nil {
 		return nil, nil, err
 	}
 
@@ -977,19 +1017,32 @@ func (r *rpcServer) GetInfo(ctx context.Context,
 
 	idPub := r.server.identityPriv.PubKey().SerializeCompressed()
 
-	bestHash, bestHeight, err := r.server.cc.chainIO.GetBestBlock()
+	primaryChain := r.server.universe.PrimaryRealm()
+
+	chainHash, err := r.server.universe.Hash(primaryChain)
+	if err != nil {
+		return nil, err
+	}
+
+	cs, err := r.server.services.ByHash(chainHash)
+	if err != nil {
+		return nil, err
+	}
+
+	bestHash, bestHeight, err := cs.cc.ChainIO.GetBestBlock()
 	if err != nil {
 		return nil, fmt.Errorf("unable to get best block info: %v", err)
 	}
 
-	isSynced, err := r.server.cc.wallet.IsSynced()
+	isSynced, err := cs.cc.Wallet.IsSynced()
 	if err != nil {
 		return nil, fmt.Errorf("unable to sync PoV of the wallet "+
 			"with current best block in the main chain: %v", err)
 	}
 
-	activeChains := make([]string, registeredChains.NumActiveChains())
-	for i, chain := range registeredChains.ActiveChains() {
+	realms := r.server.universe.Realms()
+	activeChains := make([]string, len(realms))
+	for i, chain := range realms {
 		activeChains[i] = chain.String()
 	}
 
@@ -1002,7 +1055,7 @@ func (r *rpcServer) GetInfo(ctx context.Context,
 		BlockHeight:        uint32(bestHeight),
 		BlockHash:          bestHash.String(),
 		SyncedToChain:      isSynced,
-		Testnet:            activeNetParams.Params == &chaincfg.TestNet3Params,
+		Testnet:            cs.params.Params == &chaincfg.TestNet3Params,
 		Chains:             activeChains,
 	}, nil
 }
@@ -1080,7 +1133,12 @@ func (r *rpcServer) WalletBalance(ctx context.Context,
 		}
 	}
 
-	balance, err := r.server.cc.wallet.ConfirmedBalance(1, in.WitnessOnly)
+	cs, err := r.server.services.ByTicker(ticker)
+	if err != nil {
+		return nil, err
+	}
+
+	balance, err := cs.cc.Wallet.ConfirmedBalance(1, in.WitnessOnly)
 	if err != nil {
 		return nil, err
 	}
@@ -1177,7 +1235,12 @@ func (r *rpcServer) PendingChannels(ctx context.Context,
 		}
 	}
 
-	_, currentHeight, err := r.server.cc.chainIO.GetBestBlock()
+	cs, err := r.server.services.ByTicker(ticker)
+	if err != nil {
+		return nil, err
+	}
+
+	_, currentHeight, err := cs.cc.ChainIO.GetBestBlock()
 	if err != nil {
 		return nil, err
 	}
@@ -1228,7 +1291,7 @@ func (r *rpcServer) PendingChannels(ctx context.Context,
 			// Query for the maturity state for this force closed
 			// channel. If we didn't have any time-locked outputs,
 			// then the nursery may not know of the contract.
-			nurseryInfo, err := r.server.utxoNursery.NurseryReport(&chanPoint)
+			nurseryInfo, err := cs.utxoNursery.NurseryReport(&chanPoint)
 			if err != nil && err != ErrContractNotFound {
 				return nil, fmt.Errorf("unable to obtain "+
 					"nursery report for ChannelPoint(%v): %v",
@@ -1823,6 +1886,11 @@ func (r *rpcServer) AddInvoice(ctx context.Context,
 			"payment allowed is %v", amt, maxPaymentMSat.ToSatoshis())
 	}
 
+	cs, err := r.server.services.ByTicker(ticker)
+	if err != nil {
+		return nil, err
+	}
+
 	// Next, generate the payment hash itself from the preimage. This will
 	// be used by clients to query for the state of a particular invoice.
 	rHash := sha256.Sum256(paymentPreimage[:])
@@ -1841,7 +1909,7 @@ func (r *rpcServer) AddInvoice(ctx context.Context,
 	// If specified, add a fallback address to the payment request.
 	if len(invoice.FallbackAddr) > 0 {
 		addr, err := btcutil.DecodeAddress(invoice.FallbackAddr,
-			activeNetParams.Params)
+			cs.params.Params)
 		if err != nil {
 			return nil, fmt.Errorf("invalid fallback address: %v",
 				err)
@@ -1887,7 +1955,7 @@ func (r *rpcServer) AddInvoice(ctx context.Context,
 	// Create and encode the payment request as a bech32 (zpay32) string.
 	creationDate := time.Now()
 	payReq, err := zpay32.NewInvoice(
-		activeNetParams.Params,
+		cs.params.Params,
 		rHash,
 		creationDate,
 		options...,
@@ -2119,7 +2187,12 @@ func (r *rpcServer) SubscribeTransactions(req *lnrpc.GetTransactionsRequest,
 		}
 	}
 
-	txClient, err := r.server.cc.wallet.SubscribeTransactions()
+	cs, err := r.server.services.ByTicker(ticker)
+	if err != nil {
+		return err
+	}
+
+	txClient, err := cs.cc.Wallet.SubscribeTransactions()
 	if err != nil {
 		return err
 	}
@@ -2158,7 +2231,7 @@ func (r *rpcServer) SubscribeTransactions(req *lnrpc.GetTransactionsRequest,
 // GetTransactions returns a list of describing all the known transactions
 // relevant to the wallet.
 func (r *rpcServer) GetTransactions(ctx context.Context,
-	_ *lnrpc.GetTransactionsRequest) (*lnrpc.TransactionDetails, error) {
+	in *lnrpc.GetTransactionsRequest) (*lnrpc.TransactionDetails, error) {
 
 	// Check macaroon to see if this is allowed.
 	if r.authSvc != nil {
@@ -2168,8 +2241,13 @@ func (r *rpcServer) GetTransactions(ctx context.Context,
 		}
 	}
 
+	cs, err := r.server.services.ByTicker(ticker)
+	if err != nil {
+		return nil, err
+	}
+
 	// TODO(btcsuite): add pagination support
-	transactions, err := r.server.cc.wallet.ListTransactionDetails()
+	transactions, err := cs.cc.Wallet.ListTransactionDetails()
 	if err != nil {
 		return nil, err
 	}
