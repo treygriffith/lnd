@@ -7,6 +7,7 @@ import (
 	"github.com/davecgh/go-spew/spew"
 	"github.com/lightningnetwork/lnd/autopilot"
 	"github.com/lightningnetwork/lnd/lnwire"
+	"github.com/lightningnetwork/lnd/realm"
 	"github.com/roasbeef/btcd/btcec"
 	"github.com/roasbeef/btcd/wire"
 	"github.com/roasbeef/btcutil"
@@ -41,7 +42,6 @@ func (c *chanController) OpenChannel(target *btcec.PublicKey,
 
 		lnAddr := &lnwire.NetAddress{
 			IdentityKey: target,
-			ChainNet:    activeNetParams.Net,
 		}
 
 		// We'll attempt to successively connect to each of the
@@ -85,7 +85,7 @@ func (c *chanController) OpenChannel(target *btcec.PublicKey,
 
 	// With the connection established, we'll now establish our connection
 	// to the target peer, waiting for the first update before we exit.
-	updateStream, errChan := c.server.OpenChannel(-1, target, amt, 0)
+	updateStream, errChan := c.server.OpenChannel(-1, target, amt, 0, ticker)
 
 	select {
 	case err := <-errChan:
@@ -119,11 +119,21 @@ var _ autopilot.ChannelController = (*chanController)(nil)
 func initAutoPilot(svr *server, cfg *autoPilotConfig) (*autopilot.Agent, error) {
 	atplLog.Infof("Instantiating autopilot with cfg: %v", spew.Sdump(cfg))
 
+	realmCode, err := realm.CodeFromStr(ticker)
+	if err != nil {
+		return nil, err
+	}
+
+	cc, err := svr.universe.Control(realmCode)
+	if err != nil {
+		return nil, err
+	}
+
 	// First, we'll create the preferential attachment heuristic,
 	// initialized with the passed auto pilot configuration parameters.
 	//
 	// TODO(roasbeef): switch here to dispatch specified heuristic
-	minChanSize := svr.cc.wallet.Cfg.DefaultConstraints.DustLimit * 5
+	minChanSize := cc.Wallet.Cfg.DefaultConstraints.DustLimit * 5
 	prefAttachment := autopilot.NewConstrainedPrefAttachment(
 		minChanSize, maxFundingAmount,
 		uint16(cfg.MaxChannels), cfg.Allocation,
@@ -137,7 +147,7 @@ func initAutoPilot(svr *server, cfg *autoPilotConfig) (*autopilot.Agent, error) 
 		Heuristic:      prefAttachment,
 		ChanController: &chanController{svr},
 		WalletBalance: func() (btcutil.Amount, error) {
-			return svr.cc.wallet.ConfirmedBalance(1, true)
+			return cc.Wallet.ConfirmedBalance(1, true)
 		},
 		Graph: autopilot.ChannelGraphFromDatabase(svr.chanDB.ChannelGraph()),
 	}
@@ -167,7 +177,7 @@ func initAutoPilot(svr *server, cfg *autoPilotConfig) (*autopilot.Agent, error) 
 	// Finally, we'll need to subscribe to two things: incoming
 	// transactions that modify the wallet's balance, and also any graph
 	// topology updates.
-	txnSubscription, err := svr.cc.wallet.SubscribeTransactions()
+	txnSubscription, err := cc.Wallet.SubscribeTransactions()
 	if err != nil {
 		return nil, err
 	}
