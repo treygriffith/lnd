@@ -299,8 +299,13 @@ func (p *peer) loadActiveChannels(chans []*channeldb.OpenChannel) error {
 			continue
 		}
 
-		lnChan, err := lnwallet.NewLightningChannel(p.server.cc.signer,
-			p.server.cc.chainNotifier, p.server.cc.feeEstimator, dbChan)
+		cs, err := p.server.services.ByHash(&dbChan.ChainHash)
+		if err != nil {
+			return err
+		}
+
+		lnChan, err := lnwallet.NewLightningChannel(cs.cc.Signer,
+			cs.cc.ChainNotifier, cs.cc.FeeEstimator, dbChan)
 		if err != nil {
 			return err
 		}
@@ -327,18 +332,18 @@ func (p *peer) loadActiveChannels(chans []*channeldb.OpenChannel) error {
 		peerLog.Infof("peerID(%v) loading ChannelPoint(%v)", p.id, chanPoint)
 
 		select {
-		case p.server.breachArbiter.newContracts <- lnChan:
+		case cs.breachArbiter.newContracts <- lnChan:
 		case <-p.server.quit:
 			return fmt.Errorf("server shutting down")
 		case <-p.quit:
 			return fmt.Errorf("peer shutting down")
 		}
 
-		blockEpoch, err := p.server.cc.chainNotifier.RegisterBlockEpochNtfn()
+		blockEpoch, err := cs.cc.ChainNotifier.RegisterBlockEpochNtfn()
 		if err != nil {
 			return err
 		}
-		_, currentHeight, err := p.server.cc.chainIO.GetBestBlock()
+		_, currentHeight, err := cs.cc.ChainIO.GetBestBlock()
 		if err != nil {
 			return err
 		}
@@ -378,7 +383,7 @@ func (p *peer) loadActiveChannels(chans []*channeldb.OpenChannel) error {
 				TimeLockDelta: uint32(selfPolicy.TimeLockDelta),
 			}
 		} else {
-			forwardingPolicy = &p.server.cc.routingPolicy
+			forwardingPolicy = &cs.cc.RoutingPolicy
 		}
 
 		peerLog.Tracef("Using link policy of: %v", spew.Sdump(forwardingPolicy))
@@ -392,7 +397,7 @@ func (p *peer) loadActiveChannels(chans []*channeldb.OpenChannel) error {
 			DecodeOnionObfuscator: p.server.sphinx.ExtractErrorEncrypter,
 			GetLastChannelUpdate: createGetLastUpdate(p.server.chanRouter,
 				p.PubKey(), lnChan.ShortChanID()),
-			SettledContracts: p.server.breachArbiter.settledContracts,
+			SettledContracts: cs.breachArbiter.settledContracts,
 			DebugHTLC:        cfg.DebugHTLC,
 			HodlHTLC:         cfg.HodlHTLC,
 			Registry:         p.server.invoices,
@@ -700,15 +705,49 @@ out:
 			p.queueMsg(lnwire.NewPong(pongBytes), nil)
 
 		case *lnwire.OpenChannel:
-			p.server.fundingMgr.processFundingOpen(msg, p.addr)
+			cs, err := p.server.services.ByHash(&msg.ChainHash)
+			if err != nil {
+				peerLog.Debugf("unable to find service for "+
+					"chain: %v", &msg.ChainHash)
+			} else {
+				cs.fundingMgr.processFundingOpen(msg, p.addr)
+			}
+
 		case *lnwire.AcceptChannel:
-			p.server.fundingMgr.processFundingAccept(msg, p.addr)
+			cs, err := p.serviceForPendingChanID(
+				&msg.PendingChannelID, p.addr)
+			if err != nil {
+				peerLog.Debugf("unable to find service for "+
+					"chain: %v", &msg.PendingChannelID)
+			} else {
+				cs.fundingMgr.processFundingAccept(msg, p.addr)
+			}
 		case *lnwire.FundingCreated:
-			p.server.fundingMgr.processFundingCreated(msg, p.addr)
+			cs, err := p.serviceForPendingChanID(
+				&msg.PendingChannelID, p.addr)
+			if err != nil {
+				peerLog.Debugf("unable to find service for "+
+					"chain: %v", &msg.PendingChannelID)
+			} else {
+				cs.fundingMgr.processFundingCreated(msg, p.addr)
+			}
 		case *lnwire.FundingSigned:
-			p.server.fundingMgr.processFundingSigned(msg, p.addr)
+			cs, err := p.serviceForSignedChanID(msg.ChanID)
+			if err != nil {
+				peerLog.Debugf("unable to find service for "+
+					"chain: %v", &msg.ChanID)
+			} else {
+				cs.fundingMgr.processFundingSigned(msg, p.addr)
+			}
 		case *lnwire.FundingLocked:
-			p.server.fundingMgr.processFundingLocked(msg, p.addr)
+			primaryRealm := p.server.universe.PrimaryRealm()
+			cs, err := p.server.services.ByCode(primaryRealm)
+			if err != nil {
+				peerLog.Debugf("unable to find service for "+
+					"primary chain: %v", err)
+			} else {
+				cs.fundingMgr.processFundingLocked(msg, p.addr)
+			}
 
 		case *lnwire.Shutdown:
 			select {
@@ -724,7 +763,14 @@ out:
 			}
 
 		case *lnwire.Error:
-			p.server.fundingMgr.processFundingError(msg, p.addr)
+			cs, err := p.serviceForPendingChanID(
+				(*[32]byte)(&msg.ChanID), p.addr)
+			if err != nil {
+				peerLog.Debugf("unable to find service for "+
+					"channel=%v: %v", msg.ChanID, err)
+			} else {
+				cs.fundingMgr.processFundingError(msg, p.addr)
+			}
 
 		// TODO(roasbeef): create ChanUpdater interface for the below
 		case *lnwire.UpdateAddHTLC:
@@ -759,6 +805,12 @@ out:
 		}
 
 		if isChanUpdate {
+			cs, err := p.serviceForChanID(targetChan)
+			if err != nil {
+				peerLog.Errorf("unable to find service: %v", err)
+				goto resetTimer
+			}
+
 			// If this is a channel update, then we need to feed it
 			// into the channel's in-order message stream.
 			chanStream, ok := chanMsgStreams[targetChan]
@@ -776,6 +828,7 @@ out:
 			chanStream.AddMsg(nextMsg)
 		}
 
+	resetTimer:
 		idleTimer.Reset(idleTimeout)
 	}
 
@@ -790,6 +843,106 @@ out:
 	}
 
 	peerLog.Tracef("readHandler for peer %v done", p)
+}
+
+func (p *peer) serviceForChanID(targetChan lnwire.ChannelID) (*chainService, error) {
+	p.activeChanMtx.Lock()
+	lc, ok := p.activeChannels[targetChan]
+	p.activeChanMtx.Unlock()
+
+	peerLog.Infof("active channel found?: %v", ok)
+
+	if !ok {
+		return nil, fmt.Errorf("unknown channel is not "+
+			"active: %v", targetChan)
+	}
+
+	peerLog.Infof("retrieving service for chain %v", *lc.ChainHash())
+
+	cs, err := p.server.services.ByHash(lc.ChainHash())
+	if err != nil {
+		return nil, fmt.Errorf("unable to find service "+
+			"for chain %v", lc.ChainHash())
+	}
+
+	return cs, nil
+
+}
+
+func (p *peer) serviceForPendingChanID(pendingChan *[32]byte,
+	addr *lnwire.NetAddress) (*chainService, error) {
+
+	realms := p.server.universe.Realms()
+
+	for _, realmCode := range realms {
+		cs, err := p.server.services.ByCode(realmCode)
+		if err != nil {
+			return nil, err
+		}
+
+		found, err := cs.fundingMgr.IsPendingReservation(pendingChan, addr)
+		if err != nil {
+			return nil, err
+		}
+
+		if found {
+			return cs, nil
+
+		}
+	}
+
+	return nil, fmt.Errorf("unable to find chain service for pending "+
+		"channel id: %v", pendingChan)
+}
+
+func (p *peer) serviceForSignedChanID(chanID lnwire.ChannelID) (*chainService, error) {
+
+	realms := p.server.universe.Realms()
+
+	for _, realmCode := range realms {
+		cs, err := p.server.services.ByCode(realmCode)
+		if err != nil {
+			return nil, err
+		}
+
+		found, err := cs.fundingMgr.IsSignedReservation(chanID)
+		if err != nil {
+			return nil, err
+		}
+
+		if found {
+			return cs, nil
+
+		}
+	}
+
+	return nil, fmt.Errorf("unable to find chain service for signed "+
+		"channel id: %v", chanID)
+}
+
+func (p *peer) serviceForLockedChanID(chanID lnwire.ChannelID) (*chainService, error) {
+
+	realms := p.server.universe.Realms()
+
+	for _, realmCode := range realms {
+		cs, err := p.server.services.ByCode(realmCode)
+		if err != nil {
+			return nil, err
+		}
+
+		found, err := cs.fundingMgr.IsLockedReservation(chanID)
+		if err != nil {
+			return nil, err
+		}
+
+		if found {
+			return cs, nil
+
+		}
+	}
+
+	return nil, fmt.Errorf("unable to find chain service for locked "+
+		"channel id: %v", chanID)
 }
 
 // messageSummary returns a human-readable string that summarizes a
@@ -1192,8 +1345,13 @@ func (p *peer) channelManager() {
 	responderFeeProposals := make(map[lnwire.ChannelID]uint64)
 
 	// TODO(roasbeef): move to cfg closure func
-	genDeliveryScript := func() ([]byte, error) {
-		deliveryAddr, err := p.server.cc.wallet.NewAddress(
+	genDeliveryScript := func(chanID lnwire.ChannelID) ([]byte, error) {
+		cs, err := p.serviceForChanID(chanID)
+		if err != nil {
+			return nil, err
+		}
+
+		deliveryAddr, err := cs.cc.Wallet.NewAddress(
 			lnwallet.WitnessPubKey, false,
 		)
 		if err != nil {
@@ -1234,16 +1392,22 @@ out:
 			peerLog.Infof("New channel active ChannelPoint(%v) "+
 				"with peerId(%v)", chanPoint, p.id)
 
+			cs, err := p.serviceForChanID(chanID)
+			if err != nil {
+				peerLog.Errorf("unable to find chain service: %v", err)
+				continue
+			}
+
 			// Next, we'll assemble a ChannelLink along with the
 			// necessary items it needs to function.
 			//
 			// TODO(roasbeef): panic on below?
-			blockEpoch, err := p.server.cc.chainNotifier.RegisterBlockEpochNtfn()
+			blockEpoch, err := cs.cc.ChainNotifier.RegisterBlockEpochNtfn()
 			if err != nil {
 				peerLog.Errorf("unable to register for block epoch: %v", err)
 				continue
 			}
-			_, currentHeight, err := p.server.cc.chainIO.GetBestBlock()
+			_, currentHeight, err := cs.cc.ChainIO.GetBestBlock()
 			if err != nil {
 				peerLog.Errorf("unable to get best block: %v", err)
 				continue
@@ -1254,12 +1418,12 @@ out:
 				DecodeOnionObfuscator: p.server.sphinx.ExtractErrorEncrypter,
 				GetLastChannelUpdate: createGetLastUpdate(p.server.chanRouter,
 					p.PubKey(), newChanReq.channel.ShortChanID()),
-				SettledContracts: p.server.breachArbiter.settledContracts,
+				SettledContracts: cs.breachArbiter.settledContracts,
 				DebugHTLC:        cfg.DebugHTLC,
 				HodlHTLC:         cfg.HodlHTLC,
 				Registry:         p.server.invoices,
 				Switch:           p.server.htlcSwitch,
-				FwrdingPolicy:    p.server.cc.routingPolicy,
+				FwrdingPolicy:    cs.cc.RoutingPolicy,
 				BlockEpochs:      blockEpoch,
 			}
 			link := htlcswitch.NewChannelLink(linkConfig, newChan,
@@ -1297,7 +1461,7 @@ out:
 				// new delivery address from the wallet, and
 				// turn that into it corresponding output
 				// script.
-				deliveryScript, err = genDeliveryScript()
+				deliveryScript, err = genDeliveryScript(chanID)
 				if err != nil {
 					cErr := fmt.Errorf("Unable to generate "+
 						"delivery address: %v", err)
@@ -1367,7 +1531,7 @@ out:
 
 				// As we're the responder, we'll need to
 				// generate a delivery script of our own.
-				deliveryScript, err := genDeliveryScript()
+				deliveryScript, err := genDeliveryScript(req.ChannelID)
 				if err != nil {
 					peerLog.Errorf("Unable to generate "+
 						"delivery address: %v", err)
@@ -1526,8 +1690,14 @@ func (p *peer) handleShutdownResponse(msg *lnwire.Shutdown,
 		return nil, 0
 	}
 
+	cs, err := p.serviceForChanID(msg.ChannelID)
+	if err != nil {
+		peerLog.Errorf("unable to retrieve chain service: %v", err)
+		return nil, 0
+	}
+
 	// Calculate an initial proposed fee rate for the close transaction.
-	feeRate := p.server.cc.feeEstimator.EstimateFeePerWeight(1) * 1000
+	feeRate := cs.cc.FeeEstimator.EstimateFeePerWeight(1) * 1000
 
 	// We propose a fee and send a close proposal to the peer. This will
 	// start the fee negotiations. Once both sides agree on a fee, we'll
@@ -1658,8 +1828,16 @@ func (p *peer) handleClosingSigned(localReq *htlcswitch.ChanClose,
 
 	chanPoint := channel.ChannelPoint()
 
+	cs, err := p.serviceForChanID(chanID)
+	if err != nil {
+		if localReq != nil {
+			localReq.Err <- err
+		}
+		return nil, 0
+	}
+
 	select {
-	case p.server.breachArbiter.settledContracts <- chanPoint:
+	case cs.breachArbiter.settledContracts <- chanPoint:
 	case <-p.server.quit:
 		return nil, 0
 	case <-p.quit:
@@ -1673,7 +1851,7 @@ func (p *peer) handleClosingSigned(localReq *htlcswitch.ChanClose,
 			return spew.Sdump(closeTx)
 		}))
 
-	if err := p.server.cc.wallet.PublishTransaction(closeTx); err != nil {
+	if err := cs.cc.Wallet.PublishTransaction(closeTx); err != nil {
 		// TODO(halseth): Add relevant error types to the
 		// WalletController interface as this is quite fragile.
 		if strings.Contains(err.Error(), "already exists") ||
@@ -1698,7 +1876,7 @@ func (p *peer) handleClosingSigned(localReq *htlcswitch.ChanClose,
 	// channel so we reject any incoming forward or payment requests via
 	// this channel.
 	select {
-	case p.server.breachArbiter.settledContracts <- chanPoint:
+	case cs.breachArbiter.settledContracts <- chanPoint:
 	case <-p.server.quit:
 		return nil, 0
 	}
@@ -1743,7 +1921,7 @@ func (p *peer) handleClosingSigned(localReq *htlcswitch.ChanClose,
 		}
 	}
 
-	_, bestHeight, err := p.server.cc.chainIO.GetBestBlock()
+	_, bestHeight, err := cs.cc.ChainIO.GetBestBlock()
 	if err != nil {
 		if localReq != nil {
 			localReq.Err <- err
@@ -1754,7 +1932,7 @@ func (p *peer) handleClosingSigned(localReq *htlcswitch.ChanClose,
 	// Finally, launch a goroutine which will request to be notified by the
 	// ChainNotifier once the closure transaction obtains a single
 	// confirmation.
-	notifier := p.server.cc.chainNotifier
+	notifier := cs.cc.ChainNotifier
 
 	// If any error happens during waitForChanToClose, forard it to
 	// localReq. If this channel closure is not locally initiated, localReq
@@ -1813,13 +1991,20 @@ func (p *peer) negotiateFeeAndCreateCloseTx(channel *lnwallet.LightningChannel,
 
 	peerFeeProposal := msg.FeeSatoshis
 
+	chainHash := channel.ChainHash()
+
+	cs, err := p.server.services.ByHash(chainHash)
+	if err != nil {
+		return nil, nil, 0, err
+	}
+
 	// If the fee proposed by the peer is different from what we proposed
 	// before (or we did not propose anything yet), we must check if we can
 	// accept the proposal, or if we should negotiate.
 	if peerFeeProposal != ourFeeProp {
 		// The peer has suggested a different fee from what we proposed.
 		// Let's calculate if this one is tolerable.
-		ourIdealFeeRate := p.server.cc.feeEstimator.
+		ourIdealFeeRate := cs.cc.FeeEstimator.
 			EstimateFeePerWeight(1) * 1000
 		ourIdealFee := channel.CalcFee(ourIdealFeeRate)
 		fee := calculateCompromiseFee(ourIdealFee, ourFeeProp,
