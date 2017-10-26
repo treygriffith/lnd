@@ -12,6 +12,7 @@ import (
 	"github.com/lightningnetwork/lnd/htlcswitch"
 	"github.com/lightningnetwork/lnd/lnwallet"
 	"github.com/lightningnetwork/lnd/lnwire"
+	"github.com/lightningnetwork/lnd/realm"
 	"github.com/lightningnetwork/lnd/shachain"
 	"github.com/roasbeef/btcd/btcec"
 	"github.com/roasbeef/btcd/chaincfg/chainhash"
@@ -218,22 +219,39 @@ func createTestPeer(notifier chainntnfs.ChainNotifier,
 			publishedTransactions: publTx,
 		},
 	}
-	cc := &chainControl{
-		feeEstimator:  estimator,
-		chainIO:       chainIO,
-		chainNotifier: notifier,
-		wallet:        wallet,
+	cc := &realm.ChainControl{
+		FeeEstimator:  estimator,
+		ChainIO:       chainIO,
+		ChainNotifier: notifier,
+		Wallet:        wallet,
 	}
+
+	universe := realm.NewUniverse()
+
+	s := &server{
+		chanDB:   dbAlice,
+		universe: universe,
+	}
+
+	s.initServiceMap(universe)
 
 	breachArbiter := &breachArbiter{
 		settledContracts: make(chan *wire.OutPoint, 10),
 	}
 
-	s := &server{
-		chanDB:        dbAlice,
+	cs := &chainService{
+		code:          realm.BTC,
+		hash:          regTestNetParams.Params.GenesisHash,
+		params:        &regTestNetParams,
 		cc:            cc,
 		breachArbiter: breachArbiter,
 	}
+
+	universe.RegisterParam(realm.BTC, &regTestNetParams)
+	universe.RegisterControl(realm.BTC, cc)
+
+	s.services.AddService(regTestNetParams.Params.GenesisHash, cs)
+
 	s.htlcSwitch = htlcswitch.New(htlcswitch.Config{})
 	s.htlcSwitch.Start()
 
