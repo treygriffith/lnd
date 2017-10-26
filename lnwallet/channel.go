@@ -1083,6 +1083,13 @@ func (lc *LightningChannel) Stop() {
 	lc.wg.Wait()
 }
 
+func (lc *LightningChannel) ChainHash() *chainhash.Hash {
+	lc.RLock()
+	defer lc.RUnlock()
+
+	return &lc.channelState.ChainHash
+}
+
 // HtlcRetribution contains all the items necessary to seep a revoked HTLC
 // transaction from a revoked commitment transaction broadcast by the remot
 // party.
