@@ -16,6 +16,7 @@ import (
 	"github.com/lightningnetwork/lnd/lnwire"
 	"github.com/lightningnetwork/lnd/routing/chainview"
 	"github.com/roasbeef/btcd/btcec"
+	"github.com/roasbeef/btcd/chaincfg/chainhash"
 	"github.com/roasbeef/btcd/wire"
 	"github.com/roasbeef/btcutil"
 
@@ -128,6 +129,10 @@ type Config struct {
 	// GraphPruneInterval is used as an interval to determine how often we
 	// should examine the channel graph to garbage collect zombie channels.
 	GraphPruneInterval time.Duration
+
+	// ChainRealmMap is used by the channel router to reconcile multi-chain
+	// hops, and set the realm byte on the onion packet accordingly.
+	ChainRealmMap map[chainhash.Hash]byte
 }
 
 // routeTuple is an entry within the ChannelRouter's route cache. We cache
@@ -245,10 +250,11 @@ func New(cfg Config) (*ChannelRouter, error) {
 		networkUpdates:    make(chan *routingMsg),
 		topologyClients:   make(map[uint64]*topologyClient),
 		ntfnClientUpdates: make(chan *topologyClientUpdate),
-		missionControl:    newMissionControl(cfg.Graph, selfNode),
-		selfNode:          selfNode,
-		routeCache:        make(map[routeTuple][]*Route),
-		quit:              make(chan struct{}),
+		missionControl: newMissionControl(cfg.Graph, selfNode,
+			cfg.ChainRealmMap),
+		selfNode:   selfNode,
+		routeCache: make(map[routeTuple][]*Route),
+		quit:       make(chan struct{}),
 	}, nil
 }
 
@@ -1122,7 +1128,8 @@ func (r *ChannelRouter) FindRoutes(target *btcec.PublicKey,
 		// hop in the path as it contains a "self-hop" that is inserted
 		// by our KSP algorithm.
 		route, err := newRoute(amt, sourceVertex, path[1:],
-			uint32(currentHeight), finalCLTVDelta)
+			uint32(currentHeight), finalCLTVDelta,
+			r.cfg.ChainRealmMap)
 		if err != nil {
 			continue
 		}
@@ -1195,7 +1202,10 @@ func generateSphinxPacket(route *Route, paymentHash []byte) ([]byte,
 	// Next we generate the per-hop payload which gives each node within
 	// the route the necessary information (fees, CLTV value, etc) to
 	// properly forward the payment.
-	hopPayloads := route.ToHopPayloads()
+	hopPayloads, err := route.ToHopPayloads()
+	if err != nil {
+		return nil, nil, err
+	}
 
 	log.Tracef("Constructed per-hop payloads for payment_hash=%x: %v",
 		paymentHash[:], spew.Sdump(hopPayloads))
