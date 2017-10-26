@@ -346,6 +346,108 @@ func newFundingManager(cfg fundingConfig) (*fundingManager, error) {
 	}, nil
 }
 
+type isPendingReq struct {
+	tempID *[32]byte
+	addr   *lnwire.NetAddress
+	resp   chan bool
+	err    chan error
+}
+
+func (f *fundingManager) IsPendingReservation(tempChanID *[32]byte,
+	addr *lnwire.NetAddress) (bool, error) {
+
+	respChan := make(chan bool, 1)
+	errChan := make(chan error)
+
+	req := &isPendingReq{
+		tempID: tempChanID,
+		addr:   addr,
+		resp:   respChan,
+		err:    errChan,
+	}
+	f.queries <- req
+
+	return <-respChan, <-errChan
+}
+
+func (f *fundingManager) handleIsPendingReservation(req *isPendingReq) {
+	peerIDKey := newSerializedKey(req.addr.IdentityKey)
+
+	f.resMtx.Lock()
+	peerRes, ok := f.activeReservations[peerIDKey]
+	if !ok {
+		f.resMtx.Unlock()
+		req.resp <- false
+		req.err <- nil
+		return
+	}
+	_, ok = peerRes[*req.tempID]
+	f.resMtx.Unlock()
+
+	req.resp <- ok
+	req.err <- nil
+}
+
+type isSignedReq struct {
+	chanID lnwire.ChannelID
+	resp   chan bool
+	err    chan error
+}
+
+func (f *fundingManager) IsSignedReservation(chanID lnwire.ChannelID) (bool, error) {
+
+	respChan := make(chan bool, 1)
+	errChan := make(chan error)
+
+	req := &isSignedReq{
+		chanID: chanID,
+		resp:   respChan,
+		err:    errChan,
+	}
+	f.queries <- req
+
+	return <-respChan, <-errChan
+}
+
+func (f *fundingManager) handleIsSignedReservation(req *isSignedReq) {
+	f.resMtx.Lock()
+	_, ok := f.signedReservations[req.chanID]
+	f.resMtx.Unlock()
+
+	req.resp <- ok
+	req.err <- nil
+}
+
+type isLockedReq struct {
+	chanID lnwire.ChannelID
+	resp   chan bool
+	err    chan error
+}
+
+func (f *fundingManager) IsLockedReservation(chanID lnwire.ChannelID) (bool, error) {
+
+	respChan := make(chan bool, 1)
+	errChan := make(chan error)
+
+	req := &isLockedReq{
+		chanID: chanID,
+		resp:   respChan,
+		err:    errChan,
+	}
+	f.queries <- req
+
+	return <-respChan, <-errChan
+}
+
+func (f *fundingManager) handleIsLockedReservation(req *isLockedReq) {
+	f.resMtx.Lock()
+	_, ok := f.handleFundingLockedBarriers[req.chanID]
+	f.resMtx.Unlock()
+
+	req.resp <- ok
+	req.err <- nil
+}
+
 // Start launches all helper goroutines required for handling requests sent
 // to the funding manager.
 func (f *fundingManager) Start() error {
@@ -643,6 +745,12 @@ func (f *fundingManager) reservationCoordinator() {
 			switch msg := req.(type) {
 			case *pendingChansReq:
 				f.handlePendingChannels(msg)
+			case *isPendingReq:
+				f.handleIsPendingReservation(msg)
+			case *isSignedReq:
+				f.handleIsSignedReservation(msg)
+			case *isLockedReq:
+				f.handleIsLockedReservation(msg)
 			}
 		case <-f.quit:
 			return
