@@ -1,6 +1,7 @@
 package main
 
 import (
+	"github.com/lightningnetwork/lnd/realm"
 	litecoinCfg "github.com/ltcsuite/ltcd/chaincfg"
 	"github.com/roasbeef/btcd/chaincfg"
 	bitcoinCfg "github.com/roasbeef/btcd/chaincfg"
@@ -8,87 +9,76 @@ import (
 	"github.com/roasbeef/btcd/wire"
 )
 
-// activeNetParams is a pointer to the parameters specific to the currently
-// active bitcoin network.
-var activeNetParams = bitcoinTestNetParams
-
-// bitcoinNetParams couples the p2p parameters of a network with the
-// corresponding RPC port of a daemon running on the particular network.
-type bitcoinNetParams struct {
-	*bitcoinCfg.Params
-	rpcPort string
-}
-
-// litecoinNetParams couples the p2p parameters of a network with the
-// corresponding RPC port of a daemon running on the particular network.
-type litecoinNetParams struct {
-	*litecoinCfg.Params
-	rpcPort string
-}
-
 // bitcoinTestNetParams contains parameters specific to the 3rd version of the
 // test network.
-var bitcoinTestNetParams = bitcoinNetParams{
+var bitcoinTestNetParams = realm.Params{
 	Params:  &bitcoinCfg.TestNet3Params,
-	rpcPort: "18334",
+	RpcPort: "18334",
+	Network: realm.TestNet,
 }
 
 // bitcoinSimNetParams contains parameters specific to the simulation test
 // network.
-var bitcoinSimNetParams = bitcoinNetParams{
+var bitcoinSimNetParams = realm.Params{
 	Params:  &bitcoinCfg.SimNetParams,
-	rpcPort: "18556",
+	RpcPort: "18556",
+	Network: realm.SimNet,
 }
 
 // liteTestNetParams contains parameters specific to the 4th version of the
 // test network.
-var liteTestNetParams = litecoinNetParams{
-	Params:  &litecoinCfg.TestNet4Params,
-	rpcPort: "19334",
+var liteTestNetParams = realm.Params{
+	Params:  ltcToBtcParams(&litecoinCfg.TestNet4Params),
+	RpcPort: "19334",
+	Network: realm.TestNet,
 }
 
 // regTestNetParams contains parameters specific to a local regtest network.
-var regTestNetParams = bitcoinNetParams{
+var regTestNetParams = realm.Params{
 	Params:  &bitcoinCfg.RegressionNetParams,
-	rpcPort: "18334",
+	RpcPort: "18334",
+	Network: realm.RegNet,
 }
 
 // applyLitecoinParams applies the relevant chain configuration parameters that
 // differ for litecoin to the chain parameters typed for btcsuite derivation.
 // This function is used in place of using something like interface{} to
 // abstract over _which_ chain (or fork) the parameters are for.
-func applyLitecoinParams(params *bitcoinNetParams) {
-	params.Name = liteTestNetParams.Name
-	params.Net = wire.BitcoinNet(liteTestNetParams.Net)
-	params.DefaultPort = liteTestNetParams.DefaultPort
-	params.CoinbaseMaturity = liteTestNetParams.CoinbaseMaturity
+func ltcToBtcParams(params *litecoinCfg.Params) *bitcoinCfg.Params {
+	p := &bitcoinCfg.Params{}
 
-	copy(params.GenesisHash[:], liteTestNetParams.GenesisHash[:])
+	p.Name = params.Name
+	p.Net = wire.BitcoinNet(params.Net)
+	p.DefaultPort = params.DefaultPort
+	p.CoinbaseMaturity = params.CoinbaseMaturity
+
+	p.GenesisHash = &chainhash.Hash{}
+	copy(p.GenesisHash[:], params.GenesisHash[:])
 
 	// Address encoding magics
-	params.PubKeyHashAddrID = liteTestNetParams.PubKeyHashAddrID
-	params.ScriptHashAddrID = liteTestNetParams.ScriptHashAddrID
-	params.PrivateKeyID = liteTestNetParams.PrivateKeyID
-	params.WitnessPubKeyHashAddrID = liteTestNetParams.WitnessPubKeyHashAddrID
-	params.WitnessScriptHashAddrID = liteTestNetParams.WitnessScriptHashAddrID
-	params.Bech32HRPSegwit = liteTestNetParams.Bech32HRPSegwit
+	p.PubKeyHashAddrID = params.PubKeyHashAddrID
+	p.ScriptHashAddrID = params.ScriptHashAddrID
+	p.PrivateKeyID = params.PrivateKeyID
+	p.WitnessPubKeyHashAddrID = params.WitnessPubKeyHashAddrID
+	p.WitnessScriptHashAddrID = params.WitnessScriptHashAddrID
+	p.Bech32HRPSegwit = params.Bech32HRPSegwit
 
-	copy(params.HDPrivateKeyID[:], liteTestNetParams.HDPrivateKeyID[:])
-	copy(params.HDPublicKeyID[:], liteTestNetParams.HDPublicKeyID[:])
+	copy(p.HDPrivateKeyID[:], params.HDPrivateKeyID[:])
+	copy(p.HDPublicKeyID[:], params.HDPublicKeyID[:])
 
-	params.HDCoinType = liteTestNetParams.HDCoinType
+	p.HDCoinType = params.HDCoinType
 
-	checkPoints := make([]chaincfg.Checkpoint, len(liteTestNetParams.Checkpoints))
-	for i := 0; i < len(liteTestNetParams.Checkpoints); i++ {
+	checkPoints := make([]chaincfg.Checkpoint, len(params.Checkpoints))
+	for i := 0; i < len(params.Checkpoints); i++ {
 		var chainHash chainhash.Hash
-		copy(chainHash[:], liteTestNetParams.Checkpoints[i].Hash[:])
+		copy(chainHash[:], params.Checkpoints[i].Hash[:])
 
 		checkPoints[i] = chaincfg.Checkpoint{
-			Height: liteTestNetParams.Checkpoints[i].Height,
+			Height: params.Checkpoints[i].Height,
 			Hash:   &chainHash,
 		}
 	}
-	params.Checkpoints = checkPoints
+	p.Checkpoints = checkPoints
 
-	params.rpcPort = liteTestNetParams.rpcPort
+	return p
 }
