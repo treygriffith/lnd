@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"github.com/lightningnetwork/lnd/channeldb"
+	"github.com/roasbeef/btcd/chaincfg/chainhash"
 )
 
 const (
@@ -55,6 +56,8 @@ type missionControl struct {
 
 	selfNode *channeldb.LightningNode
 
+	chainRealmMap map[chainhash.Hash]byte
+
 	sync.Mutex
 
 	// TODO(roasbeef): further counters, if vertex continually unavailable,
@@ -67,13 +70,15 @@ type missionControl struct {
 //
 // TODO(roasbeef): persist memory
 func newMissionControl(g *channeldb.ChannelGraph,
-	selfNode *channeldb.LightningNode) *missionControl {
+	selfNode *channeldb.LightningNode,
+	chainRealmMap map[chainhash.Hash]byte) *missionControl {
 
 	return &missionControl{
 		failedEdges:    make(map[uint64]time.Time),
 		failedVertexes: make(map[vertex]time.Time),
 		selfNode:       selfNode,
 		graph:          g,
+		chainRealmMap:  chainRealmMap,
 	}
 }
 
@@ -132,7 +137,7 @@ func (m *missionControl) RequestRoute(payment *LightningPayment,
 	// a route by applying the time-lock and fee requirements.
 	sourceVertex := newVertex(m.selfNode.PubKey)
 	route, err := newRoute(payment.Amount, sourceVertex, path, height,
-		finalCltvDelta)
+		finalCltvDelta, m.chainRealmMap)
 	if err != nil {
 		// TODO(roasbeef): return which edge/vertex didn't work
 		// out
