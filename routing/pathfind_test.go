@@ -296,6 +296,10 @@ func TestBasicGraphPathFinding(t *testing.T) {
 		t.Fatalf("unable to create graph: %v", err)
 	}
 
+	chainRealmMap := map[chainhash.Hash]byte{
+		bitcoinGenesis: 0,
+	}
+
 	sourceNode, err := graph.SourceNode()
 	if err != nil {
 		t.Fatalf("unable to fetch source node: %v", err)
@@ -322,7 +326,7 @@ func TestBasicGraphPathFinding(t *testing.T) {
 		t.Fatalf("unable to find path: %v", err)
 	}
 	route, err := newRoute(paymentAmt, sourceVertex, path, startingHeight,
-		finalHopCLTV)
+		finalHopCLTV, chainRealmMap)
 	if err != nil {
 		t.Fatalf("unable to create path: %v", err)
 	}
