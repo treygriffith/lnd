@@ -21,6 +21,7 @@ import (
 	"github.com/lightningnetwork/lnd/lnrpc"
 	"github.com/lightningnetwork/lnd/lnwallet"
 	"github.com/lightningnetwork/lnd/lnwire"
+	"github.com/lightningnetwork/lnd/realm"
 	"github.com/lightningnetwork/lnd/routing"
 	"github.com/roasbeef/btcd/btcec"
 	"github.com/roasbeef/btcd/chaincfg/chainhash"
@@ -40,7 +41,287 @@ var (
 	// ErrServerShuttingDown indicates that the server is in the process of
 	// gracefully exiting.
 	ErrServerShuttingDown = errors.New("server is shutting down")
+
+	ErrUnknownChainService = errors.New("chain service not found")
 )
+
+type serviceMap struct {
+	mu sync.RWMutex
+
+	universe realm.Universe
+	services map[chainhash.Hash]*chainService
+}
+
+func (s *server) initServiceMap(universe realm.Universe) error {
+	sm := &serviceMap{
+		universe: universe,
+		services: make(map[chainhash.Hash]*chainService),
+	}
+
+	for _, realmCode := range universe.Realms() {
+		hash, err := universe.Hash(realmCode)
+		if err != nil {
+			return err
+		}
+
+		params, err := universe.Param(realmCode)
+		if err != nil {
+			return err
+		}
+
+		cc, err := universe.Control(realmCode)
+		if err != nil {
+			return err
+		}
+
+		srvrLog.Infof("adding realm: %s with hash: %v", realmCode, hash)
+
+		cs, err := newChainService(s, realmCode, hash, params, cc)
+		if err != nil {
+			return err
+		}
+
+		sm.AddService(hash, cs)
+	}
+
+	s.services = sm
+
+	return nil
+}
+
+func (sm *serviceMap) AddService(hash *chainhash.Hash, cs *chainService) {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+
+	sm.services[*hash] = cs
+}
+
+func (sm *serviceMap) ByTicker(ticker string) (*chainService, error) {
+	realmCode, err := realm.CodeFromStr(ticker)
+	if err != nil {
+		return nil, err
+	}
+
+	return sm.ByCode(realmCode)
+}
+
+func (sm *serviceMap) ByCode(realmCode realm.Code) (*chainService, error) {
+	chainHash, err := sm.universe.Hash(realmCode)
+	if err != nil {
+		return nil, err
+	}
+
+	return sm.ByHash(chainHash)
+}
+
+func (sm *serviceMap) ByHash(hash *chainhash.Hash) (*chainService, error) {
+	sm.mu.RLock()
+	cs, ok := sm.services[*hash]
+	sm.mu.RUnlock()
+
+	if ok {
+		return cs, nil
+	}
+
+	return nil, ErrUnknownChainService
+}
+
+func (sm *serviceMap) StartNotifiers() error {
+	sm.mu.RLock()
+	defer sm.mu.RUnlock()
+
+	for _, cs := range sm.services {
+		if err := cs.cc.ChainNotifier.Start(); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func (sm *serviceMap) StartOnChain() error {
+	sm.mu.RLock()
+	defer sm.mu.RUnlock()
+
+	for _, cs := range sm.services {
+		if err := cs.utxoNursery.Start(); err != nil {
+			return err
+		}
+		if err := cs.breachArbiter.Start(); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func (sm *serviceMap) StartFunding() error {
+	sm.mu.RLock()
+	defer sm.mu.RUnlock()
+
+	for _, cs := range sm.services {
+		if err := cs.fundingMgr.Start(); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func (sm *serviceMap) StopNotifiers() error {
+	sm.mu.RLock()
+	defer sm.mu.RUnlock()
+
+	for _, cs := range sm.services {
+		cs.cc.ChainNotifier.Stop()
+	}
+
+	return nil
+}
+
+func (sm *serviceMap) StopOnChain() error {
+	sm.mu.RLock()
+	defer sm.mu.RUnlock()
+
+	for _, cs := range sm.services {
+		cs.utxoNursery.Stop()
+		cs.breachArbiter.Stop()
+	}
+
+	return nil
+}
+
+func (sm *serviceMap) StopFundingWalletView() error {
+	sm.mu.RLock()
+	defer sm.mu.RUnlock()
+
+	for _, cs := range sm.services {
+		cs.fundingMgr.Stop()
+		cs.cc.Wallet.Stop()
+		cs.cc.ChainView.Stop()
+	}
+
+	return nil
+}
+
+type chainService struct {
+	code   realm.Code
+	hash   *chainhash.Hash
+	params *realm.Params
+	cc     *realm.ChainControl
+
+	breachArbiter *breachArbiter
+	utxoNursery   *utxoNursery
+	fundingMgr    *fundingManager
+}
+
+func newChainService(s *server, c realm.Code, hash *chainhash.Hash,
+	params *realm.Params, cc *realm.ChainControl) (*chainService, error) {
+
+	cs := &chainService{
+		code:   c,
+		hash:   hash,
+		params: params,
+		cc:     cc,
+	}
+
+	cs.utxoNursery = newUtxoNursery(s.chanDB, cc.ChainNotifier, cc.Wallet)
+
+	// Construct a closure that wraps the htlcswitch's CloseLink method.
+	closeLink := func(chanPoint *wire.OutPoint,
+		closureType htlcswitch.ChannelCloseType) {
+		// TODO(conner): Properly respect the update and error channels
+		// returned by CloseLink.
+		s.htlcSwitch.CloseLink(chanPoint, closureType)
+	}
+
+	cs.breachArbiter = newBreachArbiter(&BreachConfig{
+		Signer:             cc.Wallet.Cfg.Signer,
+		DB:                 s.chanDB,
+		PublishTransaction: cc.Wallet.PublishTransaction,
+		Notifier:           cc.ChainNotifier,
+		ChainIO:            cc.ChainIO,
+		Estimator:          cc.FeeEstimator,
+		CloseLink:          closeLink,
+		Store:              newRetributionStore(s.chanDB),
+		GenSweepScript: func() ([]byte, error) {
+			return newSweepPkScript(cc.Wallet)
+		},
+	})
+
+	// Next, we'll initialize the funding manager itself so it can answer
+	// queries while the wallet+chain are still syncing.
+	nodeSigner := newNodeSigner(s.identityPriv)
+	var chanIDSeed [32]byte
+	if _, err := rand.Read(chanIDSeed[:]); err != nil {
+		return nil, err
+	}
+
+	fundingMgr, err := newFundingManager(fundingConfig{
+		IDKey:        s.identityPriv.PubKey(),
+		Wallet:       cc.Wallet,
+		Notifier:     cc.ChainNotifier,
+		FeeEstimator: cc.FeeEstimator,
+		SignMessage: func(pubKey *btcec.PublicKey,
+			msg []byte) (*btcec.Signature, error) {
+
+			if pubKey.IsEqual(s.identityPriv.PubKey()) {
+				return nodeSigner.SignMessage(pubKey, msg)
+			}
+
+			return cc.MsgSigner.SignMessage(pubKey, msg)
+		},
+		CurrentNodeAnnouncement: func() (lnwire.NodeAnnouncement, error) {
+			return s.genNodeAnnouncement(true)
+		},
+		SendAnnouncement: func(msg lnwire.Message) error {
+			errChan := s.authGossiper.ProcessLocalAnnouncement(msg,
+				s.identityPriv.PubKey())
+			return <-errChan
+		},
+		ArbiterChan:      cs.breachArbiter.newContracts,
+		SendToPeer:       s.SendToPeer,
+		NotifyWhenOnline: s.NotifyWhenOnline,
+		FindPeer:         s.FindPeer,
+		TempChanIDSeed:   chanIDSeed,
+		FindChannel: func(chanID lnwire.ChannelID) (*lnwallet.LightningChannel, error) {
+			dbChannels, err := s.chanDB.FetchAllChannels()
+			if err != nil {
+				return nil, err
+			}
+
+			for _, channel := range dbChannels {
+				if chanID.IsChanPoint(&channel.FundingOutpoint) {
+					return lnwallet.NewLightningChannel(
+						cc.Signer,
+						cc.ChainNotifier,
+						cc.FeeEstimator,
+						channel)
+				}
+			}
+
+			return nil, fmt.Errorf("unable to find channel")
+		},
+		DefaultRoutingPolicy: cc.RoutingPolicy,
+		NumRequiredConfs: func(chanAmt btcutil.Amount, pushAmt lnwire.MilliSatoshi) uint16 {
+			// TODO(roasbeef): add configurable mapping
+			//  * simple switch initially
+			//  * assign coefficient, etc
+			return uint16(cfg.DefaultNumChanConfs)
+		},
+		RequiredRemoteDelay: func(chanAmt btcutil.Amount) uint16 {
+			// TODO(roasbeef): add additional hooks for
+			// configuration
+			return 4
+		},
+	})
+	if err != nil {
+		return nil, err
+	}
+	cs.fundingMgr = fundingMgr
+
+	return cs, nil
+}
 
 // server is the main server of the Lightning Network Daemon. The server houses
 // global state pertaining to the wallet, database, and the rpcserver.
@@ -80,22 +361,17 @@ type server struct {
 	// disconnected.
 	ignorePeerTermination map[*peer]struct{}
 
-	cc        *chainControl
-	netParams *bitcoinNetParams
-
-	fundingMgr *fundingManager
+	universe realm.Universe
+	services *serviceMap
 
 	chanDB *channeldb.DB
 
-	htlcSwitch    *htlcswitch.Switch
-	invoices      *invoiceRegistry
-	breachArbiter *breachArbiter
+	htlcSwitch *htlcswitch.Switch
+	invoices   *invoiceRegistry
 
 	chanRouter *routing.ChannelRouter
 
 	authGossiper *discovery.AuthenticatedGossiper
-
-	utxoNursery *utxoNursery
 
 	sphinx *htlcswitch.OnionProcessor
 
@@ -117,8 +393,8 @@ type server struct {
 
 // newServer creates a new instance of the server which is to listen using the
 // passed listener address.
-func newServer(listenAddrs []string, chanDB *channeldb.DB, cr *chainRegistry,
-	privKey *btcec.PrivateKey) (*server, error) {
+func newServer(listenAddrs []string, chanDB *channeldb.DB,
+	universe realm.Universe, privKey *btcec.PrivateKey) (*server, error) {
 
 	var err error
 
@@ -130,17 +406,17 @@ func newServer(listenAddrs []string, chanDB *channeldb.DB, cr *chainRegistry,
 		}
 	}
 
-	primaryChain := cr.PrimaryChain()
+	primaryChain := universe.PrimaryRealm()
 
-	cc, ok := cr.LookupChain(primaryChain)
-	if !ok {
+	cc, err := universe.Control(primaryChain)
+	if err != nil {
 		err := fmt.Errorf("unable to find primary chain control: %v", err)
 		srvrLog.Errorf(err.Error())
 		return nil, err
 	}
 
-	netParams, ok := cr.LookupParams(primaryChain)
-	if !ok {
+	netParams, err := universe.Param(primaryChain)
+	if err != nil {
 		err := fmt.Errorf("unable to find primary chain params: %v", err)
 		srvrLog.Errorf(err.Error())
 		return nil, err
@@ -150,9 +426,9 @@ func newServer(listenAddrs []string, chanDB *channeldb.DB, cr *chainRegistry,
 
 	serializedPubKey := privKey.PubKey().SerializeCompressed()
 	s := &server{
-		chanDB:    chanDB,
-		cc:        cc,
-		netParams: netParams,
+		universe: universe,
+
+		chanDB: chanDB,
 
 		invoices: newInvoiceRegistry(chanDB),
 
@@ -279,10 +555,24 @@ func newServer(listenAddrs []string, chanDB *channeldb.DB, cr *chainRegistry,
 	nodeAnn.Signature = selfNode.AuthSig
 	s.currentNodeAnn = nodeAnn
 
+	realms := universe.Realms()
+
+	chainHashes := make(map[chainhash.Hash]struct{})
+	chainRealmMap := make(map[chainhash.Hash]byte)
+	for _, realmCode := range realms {
+		hash, err := universe.Hash(realmCode)
+		if err != nil {
+			return nil, fmt.Errorf("unknown realm code: %v",
+				realmCode)
+		}
+		chainHashes[*hash] = struct{}{}
+		chainRealmMap[*hash] = realmCode.Byte()
+	}
+
 	s.chanRouter, err = routing.New(routing.Config{
 		Graph:     chanGraph,
-		Chain:     cc.chainIO,
-		ChainView: cc.chainView,
+		Chain:     cc.ChainIO,
+		ChainView: cc.ChainView,
 		SendToSwitch: func(firstHop *btcec.PublicKey,
 			htlcAdd *lnwire.UpdateAddHTLC,
 			circuit *sphinx.Circuit) ([32]byte, error) {
@@ -301,23 +591,20 @@ func newServer(listenAddrs []string, chanDB *channeldb.DB, cr *chainRegistry,
 		},
 		ChannelPruneExpiry: time.Duration(time.Hour * 24 * 14),
 		GraphPruneInterval: time.Duration(time.Hour),
+		ChainRealmMap:      chainRealmMap,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("can't create router: %v", err)
 	}
 
-	var chainHashes = make(map[chainhash.Hash]struct{})
-	for _, activeChain := range cr.ActiveChains() {
-		activeNetParams, ok := cr.LookupParams(activeChain)
-		if !ok {
-			return nil, fmt.Errorf("unknown chain code: %v", activeChain)
-		}
-		chainHashes[*activeNetParams.Params.GenesisHash] = struct{}{}
+	primaryCC, err := universe.Control(universe.PrimaryRealm())
+	if err != nil {
+		return nil, err
 	}
 
 	s.authGossiper, err = discovery.New(discovery.Config{
 		Router:           s.chanRouter,
-		Notifier:         s.cc.chainNotifier,
+		Notifier:         primaryCC.ChainNotifier,
 		ChainHashes:      chainHashes,
 		Broadcast:        s.BroadcastMessage,
 		SendToPeer:       s.SendToPeer,
@@ -333,119 +620,9 @@ func newServer(listenAddrs []string, chanDB *channeldb.DB, cr *chainRegistry,
 		return nil, err
 	}
 
-	utxnStore, err := newNurseryStore(&bitcoinGenesis, chanDB)
-	if err != nil {
-		srvrLog.Errorf("unable to create nursery store: %v", err)
+	if err := s.initServiceMap(universe); err != nil {
 		return nil, err
 	}
-
-	s.utxoNursery = newUtxoNursery(&NurseryConfig{
-		ChainIO:      cc.chainIO,
-		ConfDepth:    1,
-		PruningDepth: 2016,
-		DB:           chanDB,
-		Estimator:    cc.feeEstimator,
-		GenSweepScript: func() ([]byte, error) {
-			return newSweepPkScript(cc.wallet)
-		},
-		Notifier:           cc.chainNotifier,
-		PublishTransaction: cc.wallet.PublishTransaction,
-		Signer:             cc.wallet.Cfg.Signer,
-		Store:              utxnStore,
-	})
-
-	// Construct a closure that wraps the htlcswitch's CloseLink method.
-	closeLink := func(chanPoint *wire.OutPoint,
-		closureType htlcswitch.ChannelCloseType) {
-		// TODO(conner): Properly respect the update and error channels
-		// returned by CloseLink.
-		s.htlcSwitch.CloseLink(chanPoint, closureType)
-	}
-
-	s.breachArbiter = newBreachArbiter(&BreachConfig{
-		ChainIO:   s.cc.chainIO,
-		CloseLink: closeLink,
-		DB:        chanDB,
-		Estimator: s.cc.feeEstimator,
-		GenSweepScript: func() ([]byte, error) {
-			return newSweepPkScript(cc.wallet)
-		},
-		Notifier:           cc.chainNotifier,
-		PublishTransaction: cc.wallet.PublishTransaction,
-		Signer:             cc.wallet.Cfg.Signer,
-		Store:              newRetributionStore(chanDB),
-	})
-
-	// Next, we'll initialize the funding manager itself so it can answer
-	// queries while the wallet+chain are still syncing.
-	nodeSigner := newNodeSigner(s.identityPriv)
-	var chanIDSeed [32]byte
-	if _, err := rand.Read(chanIDSeed[:]); err != nil {
-		return nil, err
-	}
-
-	fundingMgr, err := newFundingManager(fundingConfig{
-		IDKey:        s.identityPriv.PubKey(),
-		Wallet:       cc.wallet,
-		Notifier:     cc.chainNotifier,
-		FeeEstimator: cc.feeEstimator,
-		SignMessage: func(pubKey *btcec.PublicKey,
-			msg []byte) (*btcec.Signature, error) {
-
-			if pubKey.IsEqual(s.identityPriv.PubKey()) {
-				return nodeSigner.SignMessage(pubKey, msg)
-			}
-
-			return cc.msgSigner.SignMessage(pubKey, msg)
-		},
-		CurrentNodeAnnouncement: func() (lnwire.NodeAnnouncement, error) {
-			return s.genNodeAnnouncement(true)
-		},
-		SendAnnouncement: func(msg lnwire.Message) error {
-			errChan := s.authGossiper.ProcessLocalAnnouncement(msg,
-				s.identityPriv.PubKey())
-			return <-errChan
-		},
-		ArbiterChan:      s.breachArbiter.newContracts,
-		SendToPeer:       s.SendToPeer,
-		NotifyWhenOnline: s.NotifyWhenOnline,
-		FindPeer:         s.FindPeer,
-		TempChanIDSeed:   chanIDSeed,
-		FindChannel: func(chanID lnwire.ChannelID) (*lnwallet.LightningChannel, error) {
-			dbChannels, err := chanDB.FetchAllChannels()
-			if err != nil {
-				return nil, err
-			}
-
-			for _, channel := range dbChannels {
-				if chanID.IsChanPoint(&channel.FundingOutpoint) {
-					return lnwallet.NewLightningChannel(
-						cc.signer,
-						cc.chainNotifier,
-						cc.feeEstimator,
-						channel)
-				}
-			}
-
-			return nil, fmt.Errorf("unable to find channel")
-		},
-		DefaultRoutingPolicy: cc.routingPolicy,
-		NumRequiredConfs: func(chanAmt btcutil.Amount, pushAmt lnwire.MilliSatoshi) uint16 {
-			// TODO(roasbeef): add configurable mapping
-			//  * simple switch initially
-			//  * assign coefficient, etc
-			return uint16(cfg.DefaultNumChanConfs)
-		},
-		RequiredRemoteDelay: func(chanAmt btcutil.Amount) uint16 {
-			// TODO(roasbeef): add additional hooks for
-			// configuration
-			return 4
-		},
-	})
-	if err != nil {
-		return nil, err
-	}
-	s.fundingMgr = fundingMgr
 
 	// Create the connection manager which will be responsible for
 	// maintaining persistent outbound connections and also accepting new
@@ -487,26 +664,19 @@ func (s *server) Start() error {
 	// sufficient number of confirmations, or when the input for the
 	// funding transaction is spent in an attempt at an uncooperative close
 	// by the counterparty.
-	if err := s.cc.chainNotifier.Start(); err != nil {
+	if err := s.services.StartNotifiers(); err != nil {
 		return err
 	}
-
 	if err := s.htlcSwitch.Start(); err != nil {
 		return err
 	}
-	if err := s.utxoNursery.Start(); err != nil {
-		return err
-	}
-	if err := s.breachArbiter.Start(); err != nil {
+	if err := s.services.StartOnChain(); err != nil {
 		return err
 	}
 	if err := s.authGossiper.Start(); err != nil {
 		return err
 	}
 	if err := s.chanRouter.Start(); err != nil {
-		return err
-	}
-	if err := s.fundingMgr.Start(); err != nil {
 		return err
 	}
 
@@ -549,15 +719,12 @@ func (s *server) Stop() error {
 	close(s.quit)
 
 	// Shutdown the wallet, funding manager, and the rpc server.
-	s.cc.chainNotifier.Stop()
+	s.services.StopNotifiers()
 	s.chanRouter.Stop()
 	s.htlcSwitch.Stop()
-	s.utxoNursery.Stop()
-	s.breachArbiter.Stop()
+	s.services.StopOnChain()
 	s.authGossiper.Stop()
-	s.fundingMgr.Stop()
-	s.cc.wallet.Shutdown()
-	s.cc.chainView.Stop()
+	s.services.StopFundingWalletView()
 	s.connMgr.Stop()
 
 	// Disconnect from each active peers to ensure that
@@ -604,7 +771,7 @@ func initNetworkBootstrappers(s *server) ([]discovery.NetworkPeerBootstrapper, e
 	// If this isn't simnet mode, then one of our additional bootstrapping
 	// sources will be the set of running DNS seeds.
 	if !cfg.Bitcoin.SimNet || !cfg.Litecoin.SimNet {
-		chainHash := reverseChainMap[registeredChains.PrimaryChain()]
+		chainHash := reverseChainMap[universe.PrimaryRealm()]
 		dnsSeeds, ok := chainDNSSeeds[chainHash]
 
 		// If we have a set of DNS seeds for this chain, then we'll add
@@ -1223,7 +1390,6 @@ func (s *server) peerConnected(conn net.Conn, connReq *connmgr.ConnReq,
 	peerAddr := &lnwire.NetAddress{
 		IdentityKey: brontideConn.RemotePub(),
 		Address:     conn.RemoteAddr().(*net.TCPAddr),
-		ChainNet:    activeNetParams.Net,
 	}
 
 	// With the brontide connection established, we'll now craft the local
@@ -1656,8 +1822,8 @@ func (s *server) DisconnectPeer(pubKey *btcec.PublicKey) error {
 //
 // NOTE: This function is safe for concurrent access.
 func (s *server) OpenChannel(peerID int32, nodeKey *btcec.PublicKey,
-	localAmt btcutil.Amount,
-	pushAmt lnwire.MilliSatoshi) (chan *lnrpc.OpenStatusUpdate, chan error) {
+	localAmt btcutil.Amount, pushAmt lnwire.MilliSatoshi,
+	ticker string) (chan *lnrpc.OpenStatusUpdate, chan error) {
 
 	updateChan := make(chan *lnrpc.OpenStatusUpdate, 1)
 	errChan := make(chan error, 1)
@@ -1690,6 +1856,18 @@ func (s *server) OpenChannel(peerID int32, nodeKey *btcec.PublicKey,
 		return updateChan, errChan
 	}
 
+	realmCode, err := realm.CodeFromStr(ticker)
+	if err != nil {
+		errChan <- err
+		return updateChan, errChan
+	}
+
+	chainHash, err := s.universe.Hash(realmCode)
+	if err != nil {
+		errChan <- err
+		return updateChan, errChan
+	}
+
 	// Spawn a goroutine to send the funding workflow request to the
 	// funding manager. This allows the server to continue handling queries
 	// instead of blocking on this request which is exported as a
@@ -1697,16 +1875,22 @@ func (s *server) OpenChannel(peerID int32, nodeKey *btcec.PublicKey,
 	req := &openChanReq{
 		targetPeerID:    peerID,
 		targetPubkey:    nodeKey,
-		chainHash:       *s.netParams.GenesisHash,
+		chainHash:       *chainHash,
 		localFundingAmt: localAmt,
 		pushAmt:         pushAmt,
 		updates:         updateChan,
 		err:             errChan,
 	}
 
+	cs, err := s.services.ByHash(chainHash)
+	if err != nil {
+		errChan <- err
+		return updateChan, errChan
+	}
+
 	// TODO(roasbeef): pass in chan that's closed if/when funding succeeds
 	// so can track as persistent peer?
-	go s.fundingMgr.initFundingWorkflow(targetPeer.addr, req)
+	go cs.fundingMgr.initFundingWorkflow(targetPeer.addr, req)
 
 	return updateChan, errChan
 }
