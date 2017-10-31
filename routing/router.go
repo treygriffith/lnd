@@ -250,8 +250,8 @@ func New(cfg Config) (*ChannelRouter, error) {
 		networkUpdates:    make(chan *routingMsg),
 		topologyClients:   make(map[uint64]*topologyClient),
 		ntfnClientUpdates: make(chan *topologyClientUpdate),
-		missionControl: newMissionControl(cfg.Graph, selfNode,
-			cfg.ChainRealmMap),
+		missionControl:    newMissionControl(cfg.Graph, selfNode),
+
 		selfNode:   selfNode,
 		routeCache: make(map[routeTuple][]*Route),
 		quit:       make(chan struct{}),
@@ -1128,8 +1128,8 @@ func (r *ChannelRouter) FindRoutes(target *btcec.PublicKey,
 		// hop in the path as it contains a "self-hop" that is inserted
 		// by our KSP algorithm.
 		route, err := newRoute(amt, sourceVertex, path[1:],
-			uint32(currentHeight), finalCLTVDelta,
-			r.cfg.ChainRealmMap)
+			uint32(currentHeight), finalCLTVDelta)
+
 		if err != nil {
 			continue
 		}
@@ -1182,7 +1182,7 @@ func (r *ChannelRouter) FindRoutes(target *btcec.PublicKey,
 // the onion route specified by the passed layer 3 route. The blob returned
 // from this function can immediately be included within an HTLC add packet to
 // be sent to the first hop within the route.
-func generateSphinxPacket(route *Route, paymentHash []byte) ([]byte,
+func (r *ChannelRouter) generateSphinxPacket(route *Route, paymentHash []byte) ([]byte,
 	*sphinx.Circuit, error) {
 	// First obtain all the public keys along the route which are contained
 	// in each hop.
@@ -1202,7 +1202,7 @@ func generateSphinxPacket(route *Route, paymentHash []byte) ([]byte,
 	// Next we generate the per-hop payload which gives each node within
 	// the route the necessary information (fees, CLTV value, etc) to
 	// properly forward the payment.
-	hopPayloads, err := route.ToHopPayloads()
+	hopPayloads, err := route.ToHopPayloads(r.cfg.ChainRealmMap)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -1333,9 +1333,10 @@ func (r *ChannelRouter) SendPayment(payment *LightningPayment) ([32]byte, *Route
 		// Generate the raw encoded sphinx packet to be included along
 		// with the htlcAdd message that we send directly to the
 		// switch.
-		onionBlob, circuit, err := generateSphinxPacket(route,
+		onionBlob, circuit, err := r.generateSphinxPacket(route,
 			payment.PaymentHash[:])
 		if err != nil {
+			log.Errorf("Failed to generate sphinx packet: %v", err)
 			return preImage, nil, err
 		}
 
@@ -1348,6 +1349,8 @@ func (r *ChannelRouter) SendPayment(payment *LightningPayment) ([32]byte, *Route
 			PaymentHash: payment.PaymentHash,
 		}
 		copy(htlcAdd.OnionBlob[:], onionBlob)
+
+		log.Tracef("Sending payment with hash=%v", payment.PaymentHash[:])
 
 		// Attempt to send this payment through the network to complete
 		// the payment. If this attempt fails, then we'll continue on
@@ -1544,6 +1547,63 @@ func (r *ChannelRouter) SendPayment(payment *LightningPayment) ([32]byte, *Route
 
 		return preImage, route, nil
 	}
+}
+
+// SendToRoute attempts to send a single payment to the provided route.
+func (r *ChannelRouter) SendToRoutes(routes []*Route,
+	payment *LightningPayment) ([32]byte, *Route, error) {
+
+	log.Tracef("Dispatching route for lightning payment: %v",
+		newLogClosure(func() string {
+			if payment.Target != nil {
+				payment.Target.Curve = nil
+			}
+			return spew.Sdump(payment)
+		}),
+	)
+
+	var preImage [32]byte
+	for _, route := range routes {
+
+		// Generate the raw encoded sphinx packet to be included along
+		// with the htlcAdd message that we send directly to the
+		// switch.
+		onionBlob, circuit, err := r.generateSphinxPacket(route,
+			payment.PaymentHash[:])
+		if err != nil {
+			return preImage, nil, err
+		}
+
+		// Craft an HTLC packet to send to the layer 2 switch. The
+		// metadata within this packet will be used to route the
+		// payment through the network, starting with the first-hop.
+		htlcAdd := &lnwire.UpdateAddHTLC{
+			Amount:      route.TotalAmount,
+			Expiry:      route.TotalTimeLock,
+			PaymentHash: payment.PaymentHash,
+		}
+		copy(htlcAdd.OnionBlob[:], onionBlob)
+
+		log.Infof("sending payment to switch along route of length=%d",
+			len(route.Hops))
+
+		// Attempt to send this payment through the network to complete
+		// the payment. If this attempt fails, then we'll continue on
+		// to the next available route.
+		firstHop := route.Hops[0].Channel.Node.PubKey
+		preImage, sendError := r.cfg.SendToSwitch(firstHop, htlcAdd,
+			circuit)
+		if sendError != nil {
+			log.Errorf("Attempt to send payment to route %x failed: %v",
+				payment.PaymentHash, sendError)
+			return preImage, nil, sendError
+		}
+
+		return preImage, route, nil
+	}
+
+	return preImage, nil, errors.New("unable to send payment along any of " +
+		"the given routes")
 }
 
 // applyChannelUpdate applies a channel update directly to the database,
