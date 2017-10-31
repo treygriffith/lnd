@@ -13,6 +13,8 @@ import (
 	"github.com/roasbeef/btcutil"
 )
 
+var ticker = "BTC"
+
 // chanController is an implementation of the autopilot.ChannelController
 // interface that's backed by a running lnd instance.
 type chanController struct {
