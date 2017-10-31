@@ -237,13 +237,31 @@ func loadConfig() (*config, error) {
 	}
 
 	if cfg.Litecoin.Active {
-		if cfg.Litecoin.SimNet {
-			str := "%s: simnet mode for litecoin not currently supported"
+		if cfg.Litecoin.RegTest {
+			str := "%s: regnet mode for litecoin not currently supported"
 			return nil, fmt.Errorf(str, funcName)
 		}
 
+		var numNets int
+		var ltcParams *realm.Params
+		if cfg.Litecoin.TestNet3 {
+			numNets++
+			ltcParams = &litecoinTestNetParams
+		}
+		if cfg.Litecoin.SimNet {
+			numNets++
+			ltcParams = &litecoinSimNetParams
+		}
+
+		if numNets > 1 {
+			str := "%s: The testnet, segnet, and simnet params can't be " +
+				"used together -- choose one of the three"
+			err := fmt.Errorf(str, funcName)
+			return nil, err
+		}
+
 		// Add the ltc params to the list of network parameters
-		err := universe.RegisterParam(realm.LTC, &liteTestNetParams)
+		err := universe.RegisterParam(realm.LTC, ltcParams)
 		if err != nil {
 			return nil, err
 		}
@@ -287,6 +305,7 @@ func loadConfig() (*config, error) {
 			numNets++
 			btcParams = bitcoinSimNetParams
 		}
+
 		if numNets > 1 {
 			str := "%s: The testnet, segnet, and simnet params can't be " +
 				"used together -- choose one of the three"
