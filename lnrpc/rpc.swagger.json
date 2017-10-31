@@ -35,6 +35,13 @@
             "required": false,
             "type": "boolean",
             "format": "boolean"
+          },
+          {
+            "name": "ticker",
+            "description": "/ The chain of the wallet to query.",
+            "in": "query",
+            "required": false,
+            "type": "string"
           }
         ],
         "tags": [
@@ -113,6 +120,15 @@
             }
           }
         },
+        "parameters": [
+          {
+            "name": "ticker",
+            "description": "The chain to query for pending channels.",
+            "in": "query",
+            "required": false,
+            "type": "string"
+          }
+        ],
         "tags": [
           "Lightning"
         ]
@@ -496,6 +512,15 @@
             }
           }
         },
+        "parameters": [
+          {
+            "name": "ticker",
+            "description": "/ The chain to generate the address on.",
+            "in": "query",
+            "required": false,
+            "type": "string"
+          }
+        ],
         "tags": [
           "Lightning"
         ]
@@ -637,6 +662,15 @@
             }
           }
         },
+        "parameters": [
+          {
+            "name": "ticker",
+            "description": "The chain on which to watch for transactions.",
+            "in": "query",
+            "required": false,
+            "type": "string"
+          }
+        ],
         "tags": [
           "Lightning"
         ]
@@ -1370,6 +1404,10 @@
           "type": "string",
           "format": "uint64",
           "description": "/ Delta to use for the time-lock of the CLTV extended to the final hop."
+        },
+        "ticker": {
+          "type": "string",
+          "title": "/ The chain verify the payment request on"
         }
       }
     },
@@ -1580,6 +1618,10 @@
           "type": "string",
           "format": "int64",
           "title": "/ The number of satoshis to push to the remote side as part of the initial commitment state"
+        },
+        "ticker": {
+          "type": "string",
+          "title": "/ The ticker of the chain on which to open the channel"
         }
       }
     },
@@ -1827,6 +1869,10 @@
           "type": "string",
           "format": "int64",
           "title": "/ The amount in satoshis to send"
+        },
+        "ticker": {
+          "type": "string",
+          "title": "/ The chain on which to send the coins"
         }
       }
     },

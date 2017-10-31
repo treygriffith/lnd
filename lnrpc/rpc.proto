@@ -265,6 +265,8 @@ service Lightning {
         };
     }
 
+    rpc SendToRoute (stream SendToRouteRequest) returns (stream SendResponse);
+
     /** lncli: `addinvoice`
     AddInvoice attempts to add a new invoice to the invoice database. Any
     duplicated invoices are rejected, therefore all invoices *must* have a
@@ -470,6 +472,8 @@ message Transaction {
     int64 total_fees = 7 [ json_name = "total_fees" ];
 }
 message GetTransactionsRequest {
+        // The chain on which to watch for transactions
+        string ticker = 1;
 }
 message TransactionDetails {
     /// The list of transactions relevant to the wallet.
@@ -505,6 +509,17 @@ message SendResponse {
     Route payment_route = 3 [json_name = "payment_route"];
 }
 
+message SendToRouteRequest {
+    /// The hash to use within the payment's HTLC
+    bytes payment_hash = 1;
+
+    /// The hex-encoded hash to use within the payment's HTLC
+    string payment_hash_string = 2;
+
+    /// The routes that should be tried in sending the payment.
+    repeated Route routes = 3 [json_name = "routes"];
+}
+
 message ChannelPoint {
     // TODO(roasbeef): make str vs bytes into a oneof
 
@@ -529,6 +544,9 @@ message LightningAddress {
 message SendManyRequest {
     /// The map from addresses to amounts
     map<string, int64> AddrToAmount = 1;
+
+    // The chain on onwhich to send the coins
+    string ticker = 2;
 }
 message SendManyResponse {
     /// The id of the transaction
@@ -541,6 +559,9 @@ message SendCoinsRequest {
 
     /// The amount in satoshis to send
     int64 amount = 2;
+
+    /// The chain on which to send the coins
+    string ticker = 3;
 }
 message SendCoinsResponse {
     /// The transaction ID of the transaction
@@ -563,9 +584,14 @@ message NewAddressRequest {
 
     /// The address type
     AddressType type = 1;
+
+    /// The chain to generate the address on
+    string ticker = 2;
 }
 
 message NewWitnessAddressRequest {
+        /// The chain to generate the address on
+        string ticker = 1;
 }
 
 message NewAddressResponse {
@@ -831,6 +857,9 @@ message OpenChannelRequest {
 
     /// The number of satoshis to push to the remote side as part of the initial commitment state
     int64 push_sat = 5 [json_name = "push_sat"];
+
+    /// The ticker of the chain on which to open the channel
+    string ticker = 6 [json_name = "ticker"];
 }
 message OpenStatusUpdate {
     oneof update {
@@ -840,7 +869,11 @@ message OpenStatusUpdate {
     }
 }
 
-message PendingChannelRequest {}
+message PendingChannelRequest {
+        // The chain to query for pending channels
+        string ticker = 1;        
+}
+
 message PendingChannelResponse {
     message PendingChannel {
         string remote_node_pub = 1 [ json_name = "remote_node_pub" ];
@@ -925,6 +958,9 @@ message PendingChannelResponse {
 message WalletBalanceRequest {
     /// If only witness outputs should be considered when calculating the wallet's balance
     bool witness_only = 1;
+
+    /// The chain of the wallet to query
+    string ticker = 2;
 }
 message WalletBalanceResponse {
     /// The balance of the wallet
@@ -1219,6 +1255,9 @@ message Invoice {
 
     /// Delta to use for the time-lock of the CLTV extended to the final hop.
     uint64 cltv_expiry = 13 [json_name = "cltv_expiry"];
+
+    /// The chain verify the payment request on
+    string ticker = 14 [json_name = "ticker"];
 }
 message AddInvoiceResponse {
     bytes r_hash = 1 [json_name = "r_hash"];
