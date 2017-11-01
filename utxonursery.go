@@ -277,7 +277,7 @@ func (u *utxoNursery) Start() error {
 	// Query the nursery store for the lowest block height we could be
 	// incubating, which is taken to be the last height for which the
 	// database was purged.
-	lastPurgedHeight, err := u.cfg.Store.LastPurgedHeight()
+	lastGraduatedHeight, err := u.cfg.Store.LastGraduatedHeight()
 	if err != nil {
 		return err
 	}
@@ -288,14 +288,14 @@ func (u *utxoNursery) Start() error {
 	// NOTE: The next two steps *may* spawn go routines, thus from this
 	// point forward, we must close the nursery's quit channel if we detect
 	// any failures during startup to ensure they terminate.
-	if err := u.reloadPreschool(lastPurgedHeight); err != nil {
+	if err := u.reloadPreschool(lastGraduatedHeight); err != nil {
 		close(u.quit)
 		return err
 	}
 
 	// 3. Replay all crib and kindergarten outputs from last pruned to
 	// current best height.
-	if err := u.reloadClasses(lastPurgedHeight); err != nil {
+	if err := u.reloadClasses(lastGraduatedHeight); err != nil {
 		close(u.quit)
 		return err
 	}
@@ -341,31 +341,47 @@ func (u *utxoNursery) reloadPreschool(heightHint uint32) error {
 		return err
 	}
 
-	for i, kid := range psclOutputs {
-		txID := kid.OutPoint().Hash
-
-		confChan, err := u.cfg.Notifier.RegisterConfirmationsNtfn(
-			&txID, u.cfg.ConfDepth, heightHint)
+	for i := range psclOutputs {
+		err := u.registerCommitConf(&psclOutputs[i], heightHint)
 		if err != nil {
 			return err
 		}
-
-		utxnLog.Infof("Preschool outpoint %v re-registered for "+
-			"confirmation notification.", kid.OutPoint())
-
-		u.wg.Add(1)
-		go u.waitForCommitConf(&psclOutputs[i], confChan)
 	}
 
 	return nil
 }
 
-// reloadClasses replays the graduation of all kindergarten and crib outputs for
-// heights that have not been finalized.  This allows the nursery to
-// reinitialize all state to continue sweeping outputs, even in the event that
-// we missed blocks while offline. reloadClasses is called during the startup of
-// the UTXO Nursery.
-func (u *utxoNursery) reloadClasses(lastPrunedHeight uint32) error {
+// reloadClasses reinitializes any height-dependent state transitions for which
+// the utxonursery has not recevied confirmation, and  replays the graduation of
+// all kindergarten and crib outputs for heights that have not been finalized.
+// This allows the nursery to reinitialize all state to continue sweeping
+// outputs, even in the event that we missed blocks while offline. reloadClasses
+// is called during the startup of the UTXO Nursery.
+func (u *utxoNursery) reloadClasses(lastGraduatedHeight uint32) error {
+
+	// Begin by loading all of the still-active heights up to and including
+	// the last height we successfully graduated.
+	activeHeights, err := u.cfg.Store.HeightsBelowOrEqual(lastGraduatedHeight)
+	if err != nil {
+		return err
+	}
+
+	if len(activeHeights) > 0 {
+		utxnLog.Infof("Re-registering confirmations for %d already "+
+			"graduated heights below height=%d", len(activeHeights),
+			lastGraduatedHeight)
+	}
+
+	// Attempt to re-register notifications for any outputs still at these
+	// heights.
+	for _, classHeight := range activeHeights {
+		if err = u.regraduateClass(classHeight); err != nil {
+			utxnLog.Errorf("Failed to regraduate outputs at "+
+				"height=%v: %v", classHeight, err)
+			return err
+		}
+	}
+
 	// Get the most recently mined block.
 	_, bestHeight, err := u.cfg.ChainIO.GetBestBlock()
 	if err != nil {
@@ -374,17 +390,17 @@ func (u *utxoNursery) reloadClasses(lastPrunedHeight uint32) error {
 
 	// If we haven't yet seen any registered force closes, or we're already
 	// caught up with the current best chain, then we can exit early.
-	if lastPrunedHeight == 0 || uint32(bestHeight) == lastPrunedHeight {
+	if lastGraduatedHeight == 0 || uint32(bestHeight) == lastGraduatedHeight {
 		return nil
 	}
 
 	utxnLog.Infof("Processing outputs from missed blocks. Starting with "+
-		"blockHeight: %v, to current blockHeight: %v", lastPrunedHeight,
+		"blockHeight: %v, to current blockHeight: %v", lastGraduatedHeight,
 		bestHeight)
 
 	// Loop through and check for graduating outputs at each of the missed
 	// block heights.
-	for curHeight := lastPrunedHeight + 1; curHeight <= uint32(bestHeight); curHeight++ {
+	for curHeight := lastGraduatedHeight + 1; curHeight <= uint32(bestHeight); curHeight++ {
 		// Each attempt at graduation is protected by a lock, since
 		// there may be background processes attempting to modify the
 		// database concurrently.
@@ -444,7 +460,7 @@ func (u *utxoNursery) graduateClass(classHeight uint32) error {
 			finalTx, err = u.createSweepTx(kgtnOutputs)
 			if err != nil {
 				utxnLog.Errorf("Failed to create sweep txn at "+
-					"height %d", classHeight)
+					"height=%d", classHeight)
 				return err
 			}
 		}
@@ -454,15 +470,15 @@ func (u *utxoNursery) graduateClass(classHeight uint32) error {
 		// graduating kindergarten outputs.
 		err = u.cfg.Store.FinalizeKinder(classHeight, finalTx)
 		if err != nil {
-			utxnLog.Errorf("Failed to finalize height %d",
-				classHeight)
+			utxnLog.Errorf("Failed to finalize kindergarten at "+
+				"height=%d", classHeight)
 
 			return err
 		}
 
 		// Log if the finalized transaction is non-trivial.
 		if finalTx != nil {
-			utxnLog.Infof("Finalized kindergarten at height %d ",
+			utxnLog.Infof("Finalized kindergarten at height=%d ",
 				classHeight)
 		}
 	}
@@ -471,7 +487,7 @@ func (u *utxoNursery) graduateClass(classHeight uint32) error {
 	// restored, broadcast the txn, and set up notifications that will
 	// transition the swept kindergarten outputs into graduated outputs.
 	if finalTx != nil {
-		utxnLog.Infof("Sweeping %v time-locked outputs "+
+		utxnLog.Infof("Sweeping %v CSV-delayed outputs "+
 			"with sweep tx (txid=%v): %v", len(kgtnOutputs),
 			finalTx.TxHash(), newLogClosure(func() string {
 				return spew.Sdump(finalTx)
@@ -481,7 +497,7 @@ func (u *utxoNursery) graduateClass(classHeight uint32) error {
 			kgtnOutputs)
 		if err != nil {
 			utxnLog.Errorf("Failed to sweep %d kindergarten outputs "+
-				"at height %d: %v", len(kgtnOutputs), classHeight,
+				"at height=%d: %v", len(kgtnOutputs), classHeight,
 				err)
 			return err
 		}
@@ -493,22 +509,63 @@ func (u *utxoNursery) graduateClass(classHeight uint32) error {
 	for i := range cribOutputs {
 		err := u.sweepCribOutput(classHeight, &cribOutputs[i])
 		if err != nil {
-			utxnLog.Errorf("Failed to sweep crib output %v",
+			utxnLog.Errorf("Failed to sweep first-stage HTLC "+
+				"(CLTV-delayed) output %v",
 				cribOutputs[i].OutPoint())
 			return err
 		}
 	}
 
-	// Can't purge height below the reorg safety depth.
-	if u.cfg.PruningDepth >= classHeight {
+	return u.cfg.Store.GraduateHeight(classHeight)
+}
+
+// regraduateClass handles the steps involved in re-registering for
+// confirmations for all still-active outputs at a particular height. This is
+// used during restarts to ensure that any still-pending state transitions are
+// properly registered, so they can be driven by the utxonursery's notifier
+func (u *utxoNursery) regraduateClass(classHeight uint32) error {
+
+	// Fetch all information about the crib and kindergarten outputs at this
+	// height. In addition to the outputs, we also retrieve the finalized
+	// kindergarten sweep txn, which will be nil if we have not attempted
+	// this height before, or if no kindergarten outputs exist at this
+	// height.
+	finalTx, kgtnOutputs, cribOutputs, err := u.cfg.Store.FetchClass(
+		classHeight)
+	if err != nil {
+		return err
+	}
+
+	if finalTx != nil {
+		utxnLog.Infof("Re-registering confirmation for kindergarten "+
+			"sweep transaction at height=%d ", classHeight)
+
+		err = u.registerSweepConf(finalTx, kgtnOutputs, classHeight)
+		if err != nil {
+			utxnLog.Errorf("Failed to re-register for kindergarten "+
+				"sweep transaction at height=%d: %v",
+				classHeight, err)
+			return err
+		}
+	}
+
+	if len(cribOutputs) == 0 {
 		return nil
 	}
 
-	// Otherwise, purge all state below our threshold height.
-	heightToPurge := classHeight - u.cfg.PruningDepth
-	if err := u.cfg.Store.PurgeHeight(heightToPurge); err != nil {
-		utxnLog.Errorf("Failed to purge height %d", heightToPurge)
-		return err
+	utxnLog.Infof("Re-registering confirmation for first-stage HTLC "+
+		"outputs at height=%d ", classHeight)
+
+	// Now, we broadcast all pre-signed htlc txns from the crib outputs at
+	// this height. There is no need to finalize these txns, since the txid
+	// is predetermined when signed in the wallet.
+	for i := range cribOutputs {
+		err = u.registerTimeoutConf(&cribOutputs[i], classHeight)
+		if err != nil {
+			utxnLog.Errorf("Failed to re-register first-stage "+
+				"HTLC output %v", cribOutputs[i].OutPoint())
+			return err
+		}
 	}
 
 	return nil
@@ -661,23 +718,7 @@ func (u *utxoNursery) sweepGraduatingKinders(classHeight uint32,
 		return err
 	}
 
-	finalTxID := finalTx.TxHash()
-
-	utxnLog.Infof("Registering sweep tx %v for confs at height %d",
-		finalTxID, classHeight)
-
-	confChan, err := u.cfg.Notifier.RegisterConfirmationsNtfn(
-		&finalTxID, u.cfg.ConfDepth, classHeight)
-	if err != nil {
-		utxnLog.Errorf("unable to register notification for "+
-			"sweep confirmation: %v", finalTxID)
-		return err
-	}
-
-	u.wg.Add(1)
-	go u.waitForSweepConf(classHeight, kgtnOutputs, confChan)
-
-	return nil
+	return u.registerSweepConf(finalTx, kgtnOutputs, classHeight)
 }
 
 // sweepCribOutput broadcasts the crib output's htlc timeout txn, and sets up a
@@ -695,22 +736,7 @@ func (u *utxoNursery) sweepCribOutput(classHeight uint32, baby *babyOutput) erro
 		return err
 	}
 
-	birthTxID := baby.OutPoint().Hash
-
-	// Register for the confirmation of presigned htlc txn.
-	confChan, err := u.cfg.Notifier.RegisterConfirmationsNtfn(
-		&birthTxID, u.cfg.ConfDepth, classHeight)
-	if err != nil {
-		return err
-	}
-
-	utxnLog.Infof("Baby output %v registered for promotion "+
-		"notification.", baby.OutPoint())
-
-	u.wg.Add(1)
-	go u.waitForTimeoutConf(baby, confChan)
-
-	return nil
+	return u.registerTimeoutConf(baby, classHeight)
 }
 
 // IncubateOutputs sends a request to utxoNursery to incubate the outputs
@@ -755,9 +781,6 @@ func (u *utxoNursery) IncubateOutputs(closeSummary *lnwallet.ForceCloseSummary) 
 			Index: 0,
 		}
 
-		utxnLog.Infof("htlc resolution with expiry: %v",
-			htlcRes.Expiry)
-
 		htlcOutput := makeBabyOutput(
 			htlcOutpoint,
 			&closeSummary.ChanPoint,
@@ -775,6 +798,8 @@ func (u *utxoNursery) IncubateOutputs(closeSummary *lnwallet.ForceCloseSummary) 
 	// If there are no outputs to incubate for this channel, we simply mark
 	// the channel as fully closed.
 	if commOutput == nil && len(htlcOutputs) == 0 {
+		utxnLog.Infof("ChannelPoint(%x) has no outputs to incubate, " +
+			"marking channel as fully closed.")
 		return u.cfg.DB.MarkChanFullyClosed(&closeSummary.ChanPoint)
 	}
 
@@ -788,27 +813,7 @@ func (u *utxoNursery) IncubateOutputs(closeSummary *lnwallet.ForceCloseSummary) 
 	// 3. If we are incubating a preschool output, register for a spend
 	// notification that will transition it to the kindergarten bucket.
 	if commOutput != nil {
-		commitTxID := commOutput.OutPoint().Hash
-
-		// Register for a notification that will trigger graduation from
-		// preschool to kindergarten when the channel close transaction
-		// has been confirmed.
-		confChan, err := u.cfg.Notifier.RegisterConfirmationsNtfn(
-			&commitTxID, u.cfg.ConfDepth, u.currentHeight)
-		if err != nil {
-			utxnLog.Errorf("Unable to register preschool output %v for "+
-				"confirmation: %v", commitTxID, err)
-			return err
-		}
-
-		utxnLog.Infof("Added kid output to pscl: %v",
-			commOutput.OutPoint())
-
-		// Launch a dedicated goroutine that will move the output from
-		// the preschool bucket to the kindergarten bucket once the
-		// channel close transaction has been confirmed.
-		u.wg.Add(1)
-		go u.waitForCommitConf(commOutput, confChan)
+		return u.registerCommitConf(commOutput, u.currentHeight)
 	}
 
 	return nil
@@ -902,9 +907,6 @@ func (u *utxoNursery) NurseryReport(
 
 	var report *contractMaturityReport
 	if err := u.cfg.Store.ForChanOutputs(chanPoint, func(k, v []byte) error {
-		var prefix [4]byte
-		copy(prefix[:], k[:4])
-
 		switch {
 		case bytes.HasPrefix(k, psclPrefix),
 			bytes.HasPrefix(k, kndrPrefix):
@@ -953,6 +955,27 @@ func (u *utxoNursery) NurseryReport(
 	return report, nil
 }
 
+// registerTimeoutConf
+func (u *utxoNursery) registerTimeoutConf(baby *babyOutput, heightHint uint32) error {
+
+	birthTxID := baby.timeoutTx.TxHash()
+
+	// Register for the confirmation of presigned htlc txn.
+	confChan, err := u.cfg.Notifier.RegisterConfirmationsNtfn(
+		&birthTxID, u.cfg.ConfDepth, heightHint)
+	if err != nil {
+		return err
+	}
+
+	utxnLog.Infof("Htlc output %v registered for promotion "+
+		"notification.", baby.OutPoint())
+
+	u.wg.Add(1)
+	go u.waitForTimeoutConf(baby, confChan)
+
+	return nil
+}
+
 // waitForTimeoutConf watches for the confirmation of an htlc timeout
 // transaction, and attempts to move the htlc output from the crib bucket to the
 // kindergarten bucket upon success.
@@ -992,6 +1015,25 @@ func (u *utxoNursery) waitForTimeoutConf(baby *babyOutput,
 		"kindergarten", baby.OutPoint())
 }
 
+// registerCommitConf
+func (u *utxoNursery) registerCommitConf(kid *kidOutput, heightHint uint32) error {
+	txID := kid.OutPoint().Hash
+
+	confChan, err := u.cfg.Notifier.RegisterConfirmationsNtfn(&txID,
+		u.cfg.ConfDepth, heightHint)
+	if err != nil {
+		return err
+	}
+
+	utxnLog.Infof("Commitment outpoint %v registered for "+
+		"confirmation notification.", kid.OutPoint())
+
+	u.wg.Add(1)
+	go u.waitForCommitConf(kid, confChan)
+
+	return nil
+}
+
 // waitForCommitConf is intended to be run as a goroutine that will wait until a
 // channel force close commitment transaction has been included in a confirmed
 // block. Once the transaction has been confirmed (as reported by the Chain
@@ -1025,14 +1067,36 @@ func (u *utxoNursery) waitForCommitConf(kid *kidOutput,
 
 	err := u.cfg.Store.PreschoolToKinder(kid)
 	if err != nil {
-		utxnLog.Errorf("Unable to move kid output "+
+		utxnLog.Errorf("Unable to move commitment output "+
 			"from preschool to kindergarten bucket: %v",
 			err)
 		return
 	}
 
-	utxnLog.Infof("Preschool output %v promoted to "+
+	utxnLog.Infof("Commitment output %v promoted to "+
 		"kindergarten", kid.OutPoint())
+}
+
+func (u *utxoNursery) registerSweepConf(finalTx *wire.MsgTx,
+	kgtnOutputs []kidOutput, heightHint uint32) error {
+
+	finalTxID := finalTx.TxHash()
+
+	confChan, err := u.cfg.Notifier.RegisterConfirmationsNtfn(
+		&finalTxID, u.cfg.ConfDepth, heightHint)
+	if err != nil {
+		utxnLog.Errorf("unable to register notification for "+
+			"sweep confirmation: %v", finalTxID)
+		return err
+	}
+
+	utxnLog.Infof("Registering sweep tx %v for confs at height=%d",
+		finalTxID, heightHint)
+
+	u.wg.Add(1)
+	go u.waitForSweepConf(heightHint, kgtnOutputs, confChan)
+
+	return nil
 }
 
 // waitForSweepConf watches for the confirmation of a sweep transaction
@@ -1065,12 +1129,12 @@ func (u *utxoNursery) waitForSweepConf(classHeight uint32,
 
 	// Mark the confirmed kindergarten outputs as graduated.
 	if err := u.cfg.Store.GraduateKinder(classHeight); err != nil {
-		utxnLog.Errorf("Unable to award diplomas to %v"+
-			"graduating outputs: %v", len(kgtnOutputs), err)
+		utxnLog.Errorf("Unable to graduate %v kingdergarten outputs: "+
+			"%v", len(kgtnOutputs), err)
 		return
 	}
 
-	utxnLog.Infof("Graduated %d kindergarten outputs from height %d",
+	utxnLog.Infof("Graduated %d kindergarten outputs from height=%d",
 		len(kgtnOutputs), classHeight)
 
 	// Iterate over the kid outputs and construct a set of all channel
@@ -1090,15 +1154,6 @@ func (u *utxoNursery) waitForSweepConf(classHeight uint32,
 			return
 		}
 	}
-
-	if err := u.cfg.Store.TryFinalizeClass(classHeight); err != nil {
-		utxnLog.Errorf("Attempt to finalize height %d failed", classHeight)
-		return
-	}
-
-	lastHeight, _ := u.cfg.Store.LastFinalizedHeight()
-
-	utxnLog.Errorf("Successfully finalized height %d of %d", lastHeight, classHeight)
 }
 
 // closeAndRemoveIfMature removes a particular channel from the channel index
