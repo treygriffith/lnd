@@ -8,6 +8,7 @@ import (
 	"net"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/lightningnetwork/lnd/lnwire"
 	"github.com/roasbeef/btcd/btcec"
@@ -46,10 +47,22 @@ func establishTestConnection() (net.Conn, net.Conn, error) {
 	errChan := make(chan error)
 	connChan := make(chan net.Conn)
 	go func() {
-		conn, err := Dial(remotePriv, netAddr)
+		var err error
+		var conn net.Conn
+		for i := 0; i < 5; i++ {
+			if i > 0 {
+				time.Sleep(300 * time.Millisecond)
+			}
+
+			conn, err = Dial(remotePriv, netAddr)
+			if err == nil {
+				break
+			}
+		}
 
 		errChan <- err
 		connChan <- conn
+
 	}()
 
 	localConn, listenErr := listener.Accept()
