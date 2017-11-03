@@ -132,15 +132,16 @@ func (b *BtcdFilteredChainView) Stop() error {
 		return nil
 	}
 
+	log.Infof("FilteredChainView stopping")
+
+	close(b.quit)
+
 	// Shutdown the rpc client, this gracefully disconnects from btcd, and
 	// cleans up all related resources.
 	b.btcdConn.Shutdown()
 
 	b.blockQueue.Stop()
 
-	log.Infof("FilteredChainView stopping")
-
-	close(b.quit)
 	b.wg.Wait()
 
 	return nil
