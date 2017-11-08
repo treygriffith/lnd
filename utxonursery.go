@@ -871,6 +871,26 @@ func (u *utxoNursery) incubator(newBlockChan *chainntnfs.BlockEpochEvent) {
 	}
 }
 
+type csvOutputMaturityReport struct {
+	outpoint wire.OutPoint
+
+	amount btcutil.Amount
+
+	blocksTillMaturity uint32
+
+	confHeight uint32
+}
+
+type cltvOutputMaturityReport struct {
+	outpoint wire.OutPoint
+
+	amount btcutil.Amount
+
+	blocksTillMaturity uint32
+
+	confHeight uint32
+}
+
 // contractMaturityReport is a report that details the maturity progress of a
 // particular force closed contract.
 type contractMaturityReport struct {
@@ -881,6 +901,12 @@ type contractMaturityReport struct {
 	// limboBalance is the total number of frozen coins within this
 	// contract.
 	limboBalance btcutil.Amount
+
+	recoveredBalance btcutil.Amount
+
+	csvOutputs []csvOutputMaturityReport
+
+	cltvOutputs []cltvOutputMaturityReport
 
 	// confirmationHeight is the block height that this output originally
 	// confirmed at.
