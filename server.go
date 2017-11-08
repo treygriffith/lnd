@@ -225,7 +225,24 @@ func newChainService(s *server, c realm.Code, hash *chainhash.Hash,
 		cc:     cc,
 	}
 
-	cs.utxoNursery = newUtxoNursery(s.chanDB, cc.ChainNotifier, cc.Wallet)
+	ns, err := newNurseryStore(hash, s.chanDB)
+	if err != nil {
+		return nil, err
+	}
+
+	cs.utxoNursery = newUtxoNursery(&NurseryConfig{
+		ChainIO:   cc.ChainIO,
+		ConfDepth: 1,
+		DB:        s.chanDB,
+		Estimator: cc.FeeEstimator,
+		GenSweepScript: func() ([]byte, error) {
+			return newSweepPkScript(cc.Wallet)
+		},
+		Notifier:           cc.ChainNotifier,
+		PublishTransaction: cc.Wallet.PublishTransaction,
+		Signer:             cc.Wallet.Cfg.Signer,
+		Store:              ns,
+	})
 
 	// Construct a closure that wraps the htlcswitch's CloseLink method.
 	closeLink := func(chanPoint *wire.OutPoint,
