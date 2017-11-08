@@ -27,7 +27,7 @@ func CodeFromStr(str string) (Code, error) {
 	case "LTC":
 		return LTC, nil
 	default:
-		return 0, ErrUnknownRealm
+		return BTC, nil
 	}
 }
 
