@@ -120,7 +120,7 @@ func newChainControlFromConfig(cfg *config, chanDB *channeldb.DB,
 		case realm.LTC:
 			cc.RoutingPolicy = defaultLitecoinForwardingPolicy
 			cc.FeeEstimator = lnwallet.StaticFeeEstimator{
-				FeeRate: 100,
+				FeeRate: 200,
 			}
 		default:
 			return nil, fmt.Errorf("Default routing policy for chain %v "+
