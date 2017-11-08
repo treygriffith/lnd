@@ -602,16 +602,25 @@ func newChanMsgStream(p *peer, cid lnwire.ChannelID) *msgStream {
 		fmt.Sprintf("Update stream for ChannelID(%x) created", cid),
 		fmt.Sprintf("Update stream for ChannelID(%x) exiting", cid),
 		func(msg lnwire.Message) {
-			// We'll send a message to the funding manager and wait iff an
-			// active funding process for this channel hasn't yet completed.
-			// We do this in order to account for the following scenario: we
-			// send the funding locked message to the other side, they
-			// immediately send a channel update message, but we haven't yet
-			// sent the channel to the channelManager.
-			p.server.fundingMgr.waitUntilChannelOpen(cid)
 
-			// Dispatch the commitment update message to the proper active
-			// goroutine dedicated to this channel.
+			cs, err := p.serviceForChanID(cid)
+			if err != nil {
+				peerLog.Errorf("unable to get funding manager "+
+					"for ChannelID(%x)", cid)
+				return
+			}
+
+			// We'll send a message to the funding manager and wait
+			// iff an active funding process for this channel hasn't
+			// yet completed.  We do this in order to account for
+			// the following scenario: we send the funding locked
+			// message to the other side, they immediately send a
+			// channel update message, but we haven't yet sent the
+			// channel to the channelManager.
+			cs.fundingMgr.waitUntilChannelOpen(cid)
+
+			// Dispatch the commitment update message to the proper
+			// active goroutine dedicated to this channel.
 			if chanLink == nil {
 				link, err := p.server.htlcSwitch.GetLink(cid)
 				if err != nil {
@@ -805,12 +814,6 @@ out:
 		}
 
 		if isChanUpdate {
-			cs, err := p.serviceForChanID(targetChan)
-			if err != nil {
-				peerLog.Errorf("unable to find service: %v", err)
-				goto resetTimer
-			}
-
 			// If this is a channel update, then we need to feed it
 			// into the channel's in-order message stream.
 			chanStream, ok := chanMsgStreams[targetChan]
@@ -828,7 +831,6 @@ out:
 			chanStream.AddMsg(nextMsg)
 		}
 
-	resetTimer:
 		idleTimer.Reset(idleTimeout)
 	}
 
