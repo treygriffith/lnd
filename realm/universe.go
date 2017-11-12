@@ -4,6 +4,9 @@ import (
 	"errors"
 	"sync"
 
+	"github.com/lightningnetwork/lnd/chainntnfs"
+	"github.com/lightningnetwork/lnd/lnwallet"
+	"github.com/lightningnetwork/lnd/routing/chainview"
 	"github.com/roasbeef/btcd/chaincfg"
 	"github.com/roasbeef/btcd/chaincfg/chainhash"
 )
@@ -22,6 +25,10 @@ type Universe interface {
 	Hash(Code) (*chainhash.Hash, error)
 	Param(Code) (*Params, error)
 	Control(Code) (*ChainControl, error)
+
+	ChainMap() map[chainhash.Hash]lnwallet.BlockChainIO
+	ChainViewMap() map[chainhash.Hash]chainview.FilteredChainView
+	NotifierMap() map[chainhash.Hash]chainntnfs.ChainNotifier
 }
 
 type universe struct {
@@ -127,6 +134,48 @@ func (u *universe) Control(c Code) (*ChainControl, error) {
 	}
 
 	return nil, ErrUnregisteredRealm
+}
+
+func (u *universe) ChainMap() map[chainhash.Hash]lnwallet.BlockChainIO {
+	u.mu.RLock()
+	defer u.mu.RUnlock()
+
+	chainMap := make(map[chainhash.Hash]lnwallet.BlockChainIO)
+	for code, hash := range u.hashes {
+		if cc, ok := u.controls[code]; ok {
+			chainMap[*hash] = cc.ChainIO
+		}
+	}
+
+	return chainMap
+}
+
+func (u *universe) ChainViewMap() map[chainhash.Hash]chainview.FilteredChainView {
+	u.mu.RLock()
+	defer u.mu.RUnlock()
+
+	chainViewMap := make(map[chainhash.Hash]chainview.FilteredChainView)
+	for code, hash := range u.hashes {
+		if cc, ok := u.controls[code]; ok {
+			chainViewMap[*hash] = cc.ChainView
+		}
+	}
+
+	return chainViewMap
+}
+
+func (u *universe) NotifierMap() map[chainhash.Hash]chainntnfs.ChainNotifier {
+	u.mu.RLock()
+	defer u.mu.RUnlock()
+
+	notifierMap := make(map[chainhash.Hash]chainntnfs.ChainNotifier)
+	for code, hash := range u.hashes {
+		if cc, ok := u.controls[code]; ok {
+			notifierMap[*hash] = cc.ChainNotifier
+		}
+	}
+
+	return notifierMap
 }
 
 func (u *universe) Realms() []Code {
