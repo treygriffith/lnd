@@ -44,15 +44,6 @@ type feeUpdateRequest struct {
 // Config defines the configuration for the service. ALL elements within the
 // configuration MUST be non-nil for the service to carry out its duties.
 type Config struct {
-	// ChainHash is a hash that indicates which resident chain of the
-	// AuthenticatedGossiper. Any announcements that don't match this
-	// chain hash will be ignored.
-	//
-	// TODO(roasbeef): eventually make into map so can de-multiplex
-	// incoming announcements
-	//   * also need to do same for Notifier
-	ChainHashes map[chainhash.Hash]struct{}
-
 	// Router is the subsystem which is responsible for managing the
 	// topology of lightning network. After incoming channel, node, channel
 	// updates announcements are validated they are sent to the router in
@@ -65,7 +56,7 @@ type Config struct {
 	//
 	// TODO(roasbeef): could possibly just replace this with an epoch
 	// channel.
-	Notifier chainntnfs.ChainNotifier
+	NotifierMap map[chainhash.Hash]chainntnfs.ChainNotifier
 
 	// Broadcast broadcasts a particular set of announcements to all peers
 	// that the daemon is connected to. If supplied, the exclude parameter
@@ -126,17 +117,7 @@ type AuthenticatedGossiper struct {
 
 	// newBlocks is a channel in which new blocks connected to the end of
 	// the main chain are sent over.
-	newBlocks <-chan *chainntnfs.BlockEpoch
-
-	// prematureAnnouncements maps a block height to a set of network
-	// messages which are "premature" from our PoV. An message is premature
-	// if it claims to be anchored in a block which is beyond the current
-	// main chain tip as we know it. Premature network messages will be
-	// processed once the chain tip as we know it extends to/past the
-	// premature height.
-	//
-	// TODO(roasbeef): limit premature networkMsgs to N
-	prematureAnnouncements map[uint32][]*networkMsg
+	newBlocks map[chainhash.Hash]<-chan *chainntnfs.BlockEpoch
 
 	// waitingProofs is a persistent storage of partial channel proof
 	// announcement messages. We use it to buffer half of the material
@@ -154,9 +135,21 @@ type AuthenticatedGossiper struct {
 	// a set of channels is sent over.
 	feeUpdates chan *feeUpdateRequest
 
-	// bestHeight is the height of the block at the tip of the main chain
+	// bestHeights is the height of the block at the tip of the main chain
 	// as we know it.
-	bestHeight uint32
+	bestHeights map[chainhash.Hash]uint32
+
+	// prematureAnnouncements maps a block height to a set of network
+	// messages which are "premature" from our PoV. An message is premature
+	// if it claims to be anchored in a block which is beyond the current
+	// main chain tip as we know it. Premature network messages will be
+	// processed once the chain tip as we know it extends to/past the
+	// premature height.
+	//
+	// TODO(roasbeef): limit premature networkMsgs to N
+	prematureAnnouncements map[chainhash.Hash]map[uint32][]*networkMsg
+
+	heightMtx sync.RWMutex
 
 	// selfKey is the identity public key of the backing Lighting node.
 	selfKey *btcec.PublicKey
@@ -173,10 +166,11 @@ func New(cfg Config, selfKey *btcec.PublicKey) (*AuthenticatedGossiper, error) {
 	return &AuthenticatedGossiper{
 		selfKey:                selfKey,
 		cfg:                    &cfg,
+		newBlocks:              make(map[chainhash.Hash]<-chan *chainntnfs.BlockEpoch),
 		networkMsgs:            make(chan *networkMsg),
 		quit:                   make(chan struct{}),
 		feeUpdates:             make(chan *feeUpdateRequest),
-		prematureAnnouncements: make(map[uint32][]*networkMsg),
+		prematureAnnouncements: make(map[chainhash.Hash]map[uint32][]*networkMsg),
 		waitingProofs:          storage,
 	}, nil
 }
@@ -303,20 +297,25 @@ func (d *AuthenticatedGossiper) Start() error {
 	// First we register for new notifications of newly discovered blocks.
 	// We do this immediately so we'll later be able to consume any/all
 	// blocks which were discovered.
-	blockEpochs, err := d.cfg.Notifier.RegisterBlockEpochNtfn()
-	if err != nil {
-		return err
+	for hash, notifier := range d.cfg.NotifierMap {
+		blockEpochs, err := notifier.RegisterBlockEpochNtfn()
+		if err != nil {
+			return err
+		}
+		d.newBlocks[hash] = blockEpochs.Epochs
 	}
-	d.newBlocks = blockEpochs.Epochs
 
-	height, err := d.cfg.Router.CurrentBlockHeight()
-	if err != nil {
-		return err
+	d.bestHeights = d.cfg.Router.CurrentBlockHeights()
+
+	for hash := range d.cfg.NotifierMap {
+		d.prematureAnnouncements[hash] = make(map[uint32][]*networkMsg)
+
+		d.wg.Add(1)
+		go d.networkHandler(hash)
 	}
-	d.bestHeight = height
 
 	d.wg.Add(1)
-	go d.networkHandler()
+	go d.updateHandler()
 
 	return nil
 }
@@ -383,13 +382,7 @@ func (d *AuthenticatedGossiper) ProcessLocalAnnouncement(msg lnwire.Message,
 	return nMsg.err
 }
 
-// networkHandler is the primary goroutine that drives this service. The roles
-// of this goroutine includes answering queries related to the state of the
-// network, syncing up newly connected peers, and also periodically
-// broadcasting our latest topology state to all connected peers.
-//
-// NOTE: This MUST be run as a goroutine.
-func (d *AuthenticatedGossiper) networkHandler() {
+func (d *AuthenticatedGossiper) updateHandler() {
 	defer d.wg.Done()
 
 	// TODO(roasbeef): changes for spec compliance
@@ -443,8 +436,7 @@ func (d *AuthenticatedGossiper) networkHandler() {
 			// edges to a prior vertex/edge we previously
 			// proceeded.
 			emittedAnnouncements := d.processNetworkAnnouncement(
-				announcement,
-			)
+				announcement)
 
 			// If the announcement was accepted, then add the
 			// emitted announcements to our announce batch to be
@@ -456,41 +448,6 @@ func (d *AuthenticatedGossiper) networkHandler() {
 					emittedAnnouncements...,
 				)
 			}
-
-		// A new block has arrived, so we can re-process the previously
-		// premature announcements.
-		case newBlock, ok := <-d.newBlocks:
-			// If the channel has been closed, then this indicates
-			// the daemon is shutting down, so we exit ourselves.
-			if !ok {
-				return
-			}
-
-			// Once a new block arrives, we updates our running
-			// track of the height of the chain tip.
-			blockHeight := uint32(newBlock.Height)
-			d.bestHeight = blockHeight
-
-			// Next we check if we have any premature announcements
-			// for this height, if so, then we process them once
-			// more as normal announcements.
-			prematureAnns := d.prematureAnnouncements[uint32(newBlock.Height)]
-			if len(prematureAnns) != 0 {
-				log.Infof("Re-processing %v premature "+
-					"announcements for height %v",
-					len(prematureAnns), blockHeight)
-			}
-
-			for _, ann := range prematureAnns {
-				emittedAnnouncements := d.processNetworkAnnouncement(ann)
-				if emittedAnnouncements != nil {
-					announcementBatch = append(
-						announcementBatch,
-						emittedAnnouncements...,
-					)
-				}
-			}
-			delete(d.prematureAnnouncements, blockHeight)
 
 		// The trickle timer has ticked, which indicates we should
 		// flush to the network the pending batch of new announcements
@@ -529,6 +486,102 @@ func (d *AuthenticatedGossiper) networkHandler() {
 				log.Errorf("unable to rebroadcast stale "+
 					"channels: %v", err)
 			}
+
+		// The gossiper has been signalled to exit, to we exit our
+		// main loop so the wait group can be decremented.
+		case <-d.quit:
+			return
+		}
+	}
+}
+
+// networkHandler is the primary goroutine that drives this service. The roles
+// of this goroutine includes answering queries related to the state of the
+// network, syncing up newly connected peers, and also periodically
+// broadcasting our latest topology state to all connected peers.
+//
+// NOTE: This MUST be run as a goroutine.
+func (d *AuthenticatedGossiper) networkHandler(hash chainhash.Hash) {
+	defer d.wg.Done()
+
+	newBlocks := d.newBlocks[hash]
+
+	var announcementBatch []lnwire.Message
+
+	trickleTimer := time.NewTicker(d.cfg.TrickleDelay)
+	defer trickleTimer.Stop()
+
+	for {
+		select {
+		// A new block has arrived, so we can re-process the previously
+		// premature announcements.
+		case newBlock, ok := <-newBlocks:
+			// If the channel has been closed, then this indicates
+			// the daemon is shutting down, so we exit ourselves.
+			if !ok {
+				return
+			}
+
+			// Once a new block arrives, we updates our running
+			// track of the height of the chain tip.
+			blockHeight := uint32(newBlock.Height)
+			d.heightMtx.Lock()
+			d.bestHeights[hash] = blockHeight
+
+			// Next we check if we have any premature announcements
+			// for this height, if so, then we process them once
+			// more as normal announcements.
+			chainPrematureAnns := d.prematureAnnouncements[hash]
+			prematureAnns := chainPrematureAnns[uint32(newBlock.Height)]
+			d.heightMtx.Unlock()
+
+			if len(prematureAnns) != 0 {
+				log.Infof("Re-processing %v premature "+
+					"announcements for height %v",
+					len(prematureAnns), blockHeight)
+			}
+
+			for _, ann := range prematureAnns {
+				emittedAnnouncements := d.processNetworkAnnouncement(
+					ann)
+				if emittedAnnouncements != nil {
+					announcementBatch = append(
+						announcementBatch,
+						emittedAnnouncements...,
+					)
+				}
+			}
+
+			d.heightMtx.Lock()
+			delete(chainPrematureAnns, blockHeight)
+			d.heightMtx.Unlock()
+
+		// The trickle timer has ticked, which indicates we should
+		// flush to the network the pending batch of new announcements
+		// we've received since the last trickle tick.
+		case <-trickleTimer.C:
+			// If the current announcements batch is nil, then we
+			// have no further work here.
+			if len(announcementBatch) == 0 {
+				continue
+			}
+
+			log.Infof("Broadcasting batch of %v new announcements",
+				len(announcementBatch))
+
+			// If we have new things to announce then broadcast
+			// them to all our immediately connected peers.
+			err := d.cfg.Broadcast(nil, announcementBatch...)
+			if err != nil {
+				log.Errorf("unable to send batch "+
+					"announcements: %v", err)
+				continue
+			}
+
+			// If we're able to broadcast the current batch
+			// successfully, then we reset the batch for a new
+			// round of announcements.
+			announcementBatch = nil
 
 		// The gossiper has been signalled to exit, to we exit our
 		// main loop so the wait group can be decremented.
@@ -671,10 +724,22 @@ func (d *AuthenticatedGossiper) processFeeChanUpdate(feeUpdate *feeUpdateRequest
 // or redundant, then nil is returned. Otherwise, the set of announcements will
 // be returned which should be broadcasted to the rest of the network.
 func (d *AuthenticatedGossiper) processNetworkAnnouncement(nMsg *networkMsg) []lnwire.Message {
-	isPremature := func(chanID lnwire.ShortChannelID, delta uint32) bool {
+
+	bestHeights := make(map[chainhash.Hash]uint32)
+	d.heightMtx.Lock()
+	for hash, height := range d.bestHeights {
+		bestHeights[hash] = height
+	}
+	d.heightMtx.Unlock()
+
+	isPremature := func(hash chainhash.Hash, chanID lnwire.ShortChannelID,
+		delta uint32) bool {
+
+		bestHeight := bestHeights[hash]
+
 		// TODO(roasbeef) make height delta 6
 		//  * or configurable
-		return chanID.BlockHeight+delta > d.bestHeight
+		return chanID.BlockHeight+delta > bestHeight
 	}
 
 	var announcements []lnwire.Message
@@ -734,27 +799,31 @@ func (d *AuthenticatedGossiper) processNetworkAnnouncement(nMsg *networkMsg) []l
 	case *lnwire.ChannelAnnouncement:
 		// We'll ignore any channel announcements that target any chain
 		// other than the set of chains we know of.
-		if _, ok := d.cfg.ChainHashes[msg.ChainHash]; !ok {
+		if _, ok := d.cfg.NotifierMap[msg.ChainHash]; !ok {
 			log.Errorf("Ignoring ChannelAnnouncement from "+
 				"chain=%v, gossiper on %d other chains", msg.ChainHash,
-				len(d.cfg.ChainHashes))
+				len(d.cfg.NotifierMap))
 			return nil
 		}
 
 		// If the advertised inclusionary block is beyond our knowledge
 		// of the chain tip, then we'll put the announcement in limbo
 		// to be fully verified once we advance forward in the chain.
-		if nMsg.isRemote && isPremature(msg.ShortChannelID, 0) {
+		if nMsg.isRemote &&
+			isPremature(msg.ChainHash, msg.ShortChannelID, 0) {
+
+			bestHeight := bestHeights[msg.ChainHash]
 			blockHeight := msg.ShortChannelID.BlockHeight
 			log.Infof("Announcement for chan_id=(%v), is premature: "+
 				"advertises height %v, only height %v is known",
 				msg.ShortChannelID.ToUint64(),
-				msg.ShortChannelID.BlockHeight, d.bestHeight)
+				msg.ShortChannelID.BlockHeight, bestHeight)
 
-			d.prematureAnnouncements[blockHeight] = append(
-				d.prematureAnnouncements[blockHeight],
-				nMsg,
-			)
+			d.heightMtx.Lock()
+			chainPrematureAnns := d.prematureAnnouncements[msg.ChainHash]
+			chainPrematureAnns[blockHeight] = append(
+				chainPrematureAnns[blockHeight], nMsg)
+			d.heightMtx.Unlock()
 			return nil
 		}
 
@@ -838,10 +907,10 @@ func (d *AuthenticatedGossiper) processNetworkAnnouncement(nMsg *networkMsg) []l
 	case *lnwire.ChannelUpdate:
 		// We'll ignore any channel announcements that target any chain
 		// other than the set of chains we know of.
-		if _, ok := d.cfg.ChainHashes[msg.ChainHash]; !ok {
+		if _, ok := d.cfg.NotifierMap[msg.ChainHash]; !ok {
 			log.Errorf("Ignoring ChannelUpdate from "+
 				"chain=%v, gossiper on %d other chain", msg.ChainHash,
-				len(d.cfg.ChainHashes))
+				len(d.cfg.NotifierMap))
 			return nil
 		}
 
@@ -851,16 +920,21 @@ func (d *AuthenticatedGossiper) processNetworkAnnouncement(nMsg *networkMsg) []l
 		// If the advertised inclusionary block is beyond our knowledge
 		// of the chain tip, then we'll put the announcement in limbo
 		// to be fully verified once we advance forward in the chain.
-		if nMsg.isRemote && isPremature(msg.ShortChannelID, 0) {
+		if nMsg.isRemote &&
+			isPremature(msg.ChainHash, msg.ShortChannelID, 0) {
+
+			bestHeight := bestHeights[msg.ChainHash]
 			log.Infof("Update announcement for "+
 				"short_chan_id(%v), is premature: advertises "+
 				"height %v, only height %v is known",
-				shortChanID, blockHeight, d.bestHeight)
+				shortChanID, blockHeight,
+				bestHeight)
 
-			d.prematureAnnouncements[blockHeight] = append(
-				d.prematureAnnouncements[blockHeight],
-				nMsg,
-			)
+			d.heightMtx.Lock()
+			chainPrematureAnns := d.prematureAnnouncements[msg.ChainHash]
+			chainPrematureAnns[blockHeight] = append(
+				chainPrematureAnns[blockHeight], nMsg)
+			d.heightMtx.Unlock()
 			return nil
 		}
 
@@ -945,26 +1019,6 @@ func (d *AuthenticatedGossiper) processNetworkAnnouncement(nMsg *networkMsg) []l
 			prefix = "remote"
 		}
 
-		log.Infof("Received new channel announcement: %v", spew.Sdump(msg))
-
-		// By the specification, channel announcement proofs should be
-		// sent after some number of confirmations after channel was
-		// registered in bitcoin blockchain. Therefore, we check if the
-		// proof is premature.  If so we'll halt processing until the
-		// expected announcement height.  This allows us to be tolerant
-		// to other clients if this constraint was changed.
-		if isPremature(msg.ShortChannelID, d.cfg.ProofMatureDelta) {
-			d.prematureAnnouncements[needBlockHeight] = append(
-				d.prematureAnnouncements[needBlockHeight],
-				nMsg,
-			)
-			log.Infof("Premature proof announcement, "+
-				"current block height lower than needed: %v <"+
-				" %v, add announcement to reprocessing batch",
-				d.bestHeight, needBlockHeight)
-			return nil
-		}
-
 		// Ensure that we know of a channel with the target channel ID
 		// before proceeding further.
 		chanInfo, e1, e2, err := d.cfg.Router.GetChannelByID(msg.ShortChannelID)
@@ -985,6 +1039,33 @@ func (d *AuthenticatedGossiper) processNetworkAnnouncement(nMsg *networkMsg) []l
 				"short_chan_id=%v, adding"+
 				"to waiting batch", prefix, shortChanID)
 			nMsg.err <- nil
+			return nil
+		}
+
+		log.Infof("Received new channel announcement: %v", spew.Sdump(msg))
+
+		// By the specification, channel announcement proofs should be
+		// sent after some number of confirmations after channel was
+		// registered in bitcoin blockchain. Therefore, we check if the
+		// proof is premature.  If so we'll halt processing until the
+		// expected announcement height.  This allows us to be tolerant
+		// to other clients if this constraint was changed.
+		if isPremature(chanInfo.ChainHash, msg.ShortChannelID,
+			d.cfg.ProofMatureDelta) {
+
+			d.heightMtx.Lock()
+			chainPrematureAnns := d.prematureAnnouncements[chanInfo.ChainHash]
+			chainPrematureAnns[needBlockHeight] = append(
+				chainPrematureAnns[needBlockHeight],
+				nMsg,
+			)
+			d.heightMtx.Unlock()
+
+			bestHeight := d.bestHeights[chanInfo.ChainHash]
+			log.Infof("Premature proof announcement, "+
+				"current block height lower than needed: %v <"+
+				" %v, add announcement to reprocessing batch",
+				bestHeight, needBlockHeight)
 			return nil
 		}
 
