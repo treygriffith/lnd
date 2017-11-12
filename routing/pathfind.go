@@ -224,7 +224,7 @@ func (r *Route) ToHopPayloads(
 // NOTE: The passed slice of ChannelHops MUST be sorted in forward order: from
 // the source to the target node of the path finding attempt.
 func newRoute(amtToSend lnwire.MilliSatoshi, sourceVertex vertex,
-	pathEdges []*ChannelHop, currentHeight uint32,
+	pathEdges []*ChannelHop, currentHeights map[chainhash.Hash]uint32,
 	finalCLTVDelta uint16) (*Route, error) {
 
 	// First, we'll create a new empty route with enough hops to match the
@@ -232,11 +232,10 @@ func newRoute(amtToSend lnwire.MilliSatoshi, sourceVertex vertex,
 	// height, as this is the basis that all of the time locks will be
 	// calculated from.
 	route := &Route{
-		Hops:          make([]*Hop, len(pathEdges)),
-		TotalTimeLock: currentHeight,
-		nodeIndex:     make(map[vertex]struct{}),
-		chanIndex:     make(map[uint64]struct{}),
-		nextHopMap:    make(map[vertex]*ChannelHop),
+		Hops:       make([]*Hop, len(pathEdges)),
+		nodeIndex:  make(map[vertex]struct{}),
+		chanIndex:  make(map[uint64]struct{}),
+		nextHopMap: make(map[vertex]*ChannelHop),
 	}
 
 	// TODO(roasbeef): need to do sanity check to ensure we don't make a
@@ -334,9 +333,11 @@ func newRoute(amtToSend lnwire.MilliSatoshi, sourceVertex vertex,
 			// As this is the last hop, we'll use the specified
 			// final CLTV delta value instead of the value from the
 			// last link in the route.
-			route.TotalTimeLock += uint32(finalCLTVDelta)
 
-			nextHop.OutgoingTimeLock = currentHeight + uint32(finalCLTVDelta)
+			chainHeight := currentHeights[edge.Chain]
+
+			route.TotalTimeLock = chainHeight + uint32(finalCLTVDelta)
+			nextHop.OutgoingTimeLock = chainHeight + uint32(finalCLTVDelta)
 		} else {
 			// Next, increment the total timelock of the entire
 			// route such that each hops time lock increases as we
