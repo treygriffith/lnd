@@ -425,13 +425,6 @@ func newServer(listenAddrs []string, chanDB *channeldb.DB,
 
 	primaryChain := universe.PrimaryRealm()
 
-	cc, err := universe.Control(primaryChain)
-	if err != nil {
-		err := fmt.Errorf("unable to find primary chain control: %v", err)
-		srvrLog.Errorf(err.Error())
-		return nil, err
-	}
-
 	netParams, err := universe.Param(primaryChain)
 	if err != nil {
 		err := fmt.Errorf("unable to find primary chain params: %v", err)
@@ -587,9 +580,9 @@ func newServer(listenAddrs []string, chanDB *channeldb.DB,
 	}
 
 	s.chanRouter, err = routing.New(routing.Config{
-		Graph:     chanGraph,
-		Chain:     cc.ChainIO,
-		ChainView: cc.ChainView,
+		Graph:        chanGraph,
+		ChainMap:     universe.ChainMap(),
+		ChainViewMap: universe.ChainViewMap(),
 		SendToSwitch: func(firstHop *btcec.PublicKey,
 			htlcAdd *lnwire.UpdateAddHTLC,
 			circuit *sphinx.Circuit) ([32]byte, error) {
@@ -614,15 +607,9 @@ func newServer(listenAddrs []string, chanDB *channeldb.DB,
 		return nil, fmt.Errorf("can't create router: %v", err)
 	}
 
-	primaryCC, err := universe.Control(universe.PrimaryRealm())
-	if err != nil {
-		return nil, err
-	}
-
 	s.authGossiper, err = discovery.New(discovery.Config{
 		Router:           s.chanRouter,
-		Notifier:         primaryCC.ChainNotifier,
-		ChainHashes:      chainHashes,
+		NotifierMap:      universe.NotifierMap(),
 		Broadcast:        s.BroadcastMessage,
 		SendToPeer:       s.SendToPeer,
 		ProofMatureDelta: 0,
