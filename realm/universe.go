@@ -26,6 +26,7 @@ type Universe interface {
 	Param(Code) (*Params, error)
 	Control(Code) (*ChainControl, error)
 
+	ChainRealmMap() map[chainhash.Hash]byte
 	ChainMap() map[chainhash.Hash]lnwallet.BlockChainIO
 	ChainViewMap() map[chainhash.Hash]chainview.FilteredChainView
 	NotifierMap() map[chainhash.Hash]chainntnfs.ChainNotifier
@@ -134,6 +135,18 @@ func (u *universe) Control(c Code) (*ChainControl, error) {
 	}
 
 	return nil, ErrUnregisteredRealm
+}
+
+func (u *universe) ChainRealmMap() map[chainhash.Hash]byte {
+	u.mu.RLock()
+	defer u.mu.RUnlock()
+
+	chainRealmMap := make(map[chainhash.Hash]byte)
+	for code, hash := range u.hashes {
+		chainRealmMap[*hash] = code.Byte()
+	}
+
+	return chainRealmMap
 }
 
 func (u *universe) ChainMap() map[chainhash.Hash]lnwallet.BlockChainIO {
