@@ -377,15 +377,14 @@ func (r *ChannelRouter) syncGraphWithChain(hash, bestHash chainhash.Hash) error 
 	r.bestMtx.RUnlock()
 
 	pruneHash, pruneHeight, err := r.cfg.Graph.PruneTip(hash)
-	if err != nil {
-		switch {
-		// If the graph has never been pruned, or hasn't fully been
-		// created yet, then we don't treat this as an explicit error.
-		case err == channeldb.ErrGraphNeverPruned:
-		case err == channeldb.ErrGraphNotFound:
-		default:
-			return err
-		}
+	switch err {
+	case nil:
+	// If the graph has never been pruned, or hasn't fully been created yet,
+	// then we don't treat this as an explicit error.
+	case channeldb.ErrGraphNeverPruned:
+	case channeldb.ErrGraphNotFound:
+	default:
+		return err
 	}
 
 	log.Infof("Prune tip for Channel Graph: height=%v, hash=%v", pruneHeight,
