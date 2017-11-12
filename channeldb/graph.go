@@ -582,8 +582,9 @@ const (
 // prune the graph is stored so callers can ensure the graph is fully in sync
 // with the current UTXO state. A slice of channels that have been closed by
 // the target block are returned if the function succeeds without error.
-func (c *ChannelGraph) PruneGraph(spentOutputs []*wire.OutPoint,
-	blockHash *chainhash.Hash, blockHeight uint32) ([]*ChannelEdgeInfo, error) {
+func (c *ChannelGraph) PruneGraph(hash chainhash.Hash,
+	spentOutputs []*wire.OutPoint, blockHash *chainhash.Hash,
+	blockHeight uint32) ([]*ChannelEdgeInfo, error) {
 
 	var chansClosed []*ChannelEdgeInfo
 
@@ -649,7 +650,13 @@ func (c *ChannelGraph) PruneGraph(spentOutputs []*wire.OutPoint,
 			return err
 		}
 
-		pruneBucket, err := metaBucket.CreateBucketIfNotExists(pruneLogBucket)
+		chainPruneBucket, err := metaBucket.CreateBucketIfNotExists(hash[:])
+		if err != nil {
+			return err
+		}
+
+		pruneBucket, err := chainPruneBucket.CreateBucketIfNotExists(
+			pruneLogBucket)
 		if err != nil {
 			return err
 		}
@@ -679,8 +686,8 @@ func (c *ChannelGraph) PruneGraph(spentOutputs []*wire.OutPoint,
 // set to the last prune height valid for the remaining chain.
 // Channels that were removed from the graph resulting from the
 // disconnected block are returned.
-func (c *ChannelGraph) DisconnectBlockAtHeight(height uint32) ([]*ChannelEdgeInfo,
-	error) {
+func (c *ChannelGraph) DisconnectBlockAtHeight(hash chainhash.Hash,
+	height uint32) ([]*ChannelEdgeInfo, error) {
 
 	// Every channel having a ShortChannelID starting at 'height'
 	// will no longer be confirmed.
@@ -746,7 +753,13 @@ func (c *ChannelGraph) DisconnectBlockAtHeight(height uint32) ([]*ChannelEdgeInf
 			return err
 		}
 
-		pruneBucket, err := metaBucket.CreateBucketIfNotExists(pruneLogBucket)
+		chainPruneBucket, err := metaBucket.CreateBucketIfNotExists(hash[:])
+		if err != nil {
+			return err
+		}
+
+		pruneBucket, err := chainPruneBucket.CreateBucketIfNotExists(
+			pruneLogBucket)
 		if err != nil {
 			return err
 		}
@@ -777,7 +790,9 @@ func (c *ChannelGraph) DisconnectBlockAtHeight(height uint32) ([]*ChannelEdgeInf
 // used to prune channels in the graph. Knowing the "prune tip" allows callers
 // to tell if the graph is currently in sync with the current best known UTXO
 // state.
-func (c *ChannelGraph) PruneTip() (*chainhash.Hash, uint32, error) {
+func (c *ChannelGraph) PruneTip(hash chainhash.Hash) (*chainhash.Hash,
+	uint32, error) {
+
 	var (
 		tipHash   chainhash.Hash
 		tipHeight uint32
@@ -788,7 +803,11 @@ func (c *ChannelGraph) PruneTip() (*chainhash.Hash, uint32, error) {
 		if graphMeta == nil {
 			return ErrGraphNotFound
 		}
-		pruneBucket := graphMeta.Bucket(pruneLogBucket)
+		chainPruneBucket := graphMeta.Bucket(hash[:])
+		if chainPruneBucket == nil {
+			return ErrGraphNotFound
+		}
+		pruneBucket := chainPruneBucket.Bucket(pruneLogBucket)
 		if pruneBucket == nil {
 			return ErrGraphNeverPruned
 		}
