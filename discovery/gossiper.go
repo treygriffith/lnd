@@ -726,11 +726,11 @@ func (d *AuthenticatedGossiper) processFeeChanUpdate(feeUpdate *feeUpdateRequest
 func (d *AuthenticatedGossiper) processNetworkAnnouncement(nMsg *networkMsg) []lnwire.Message {
 
 	bestHeights := make(map[chainhash.Hash]uint32)
-	d.heightMtx.Lock()
+	d.heightMtx.RLock()
 	for hash, height := range d.bestHeights {
 		bestHeights[hash] = height
 	}
-	d.heightMtx.Unlock()
+	d.heightMtx.RUnlock()
 
 	isPremature := func(hash chainhash.Hash, chanID lnwire.ShortChannelID,
 		delta uint32) bool {
@@ -1061,7 +1061,7 @@ func (d *AuthenticatedGossiper) processNetworkAnnouncement(nMsg *networkMsg) []l
 			)
 			d.heightMtx.Unlock()
 
-			bestHeight := d.bestHeights[chanInfo.ChainHash]
+			bestHeight := bestHeights[chanInfo.ChainHash]
 			log.Infof("Premature proof announcement, "+
 				"current block height lower than needed: %v <"+
 				" %v, add announcement to reprocessing batch",
