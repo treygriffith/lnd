@@ -287,18 +287,6 @@ func (r *ChannelRouter) Start() error {
 		r.staleBlocks[hash] = chainView.DisconnectedBlocks()
 	}
 
-	_, pruneHeight, err := r.cfg.Graph.PruneTip()
-	if err != nil {
-		switch {
-		// If the graph has never been pruned, or hasn't fully been
-		// created yet, then we don't treat this as an explicit error.
-		case err == channeldb.ErrGraphNeverPruned:
-		case err == channeldb.ErrGraphNotFound:
-		default:
-			return err
-		}
-	}
-
 	// Before we perform our manual block pruning, we'll construct and
 	// apply a fresh chain filter to the active FilteredChainView instance.
 	// We do this before, as otherwise we may miss on-chain events as the
@@ -308,8 +296,19 @@ func (r *ChannelRouter) Start() error {
 		return err
 	}
 
-	for _, chainView := range r.cfg.ChainViewMap {
-		log.Infof("Filtering chain using %v channels active", len(channelView))
+	log.Infof("Filtering chain using %v channels active", len(channelView))
+
+	for hash, chainView := range r.cfg.ChainViewMap {
+		_, pruneHeight, err := r.cfg.Graph.PruneTip(hash)
+		switch err {
+		// If the graph has never been pruned, or hasn't fully been
+		// created yet, then we don't treat this as an explicit error.
+		case nil:
+		case channeldb.ErrGraphNeverPruned:
+		case channeldb.ErrGraphNotFound:
+		default:
+			return err
+		}
 
 		err = chainView.UpdateFilter(channelView, pruneHeight)
 		if err != nil {
@@ -319,8 +318,15 @@ func (r *ChannelRouter) Start() error {
 
 	// Before we begin normal operation of the router, we first need to
 	// synchronize the channel graph to the latest state of the UTXO set.
-	for hash := range r.cfg.ChainMap {
-		if err := r.syncGraphWithChain(hash); err != nil {
+	for hash, chain := range r.cfg.ChainMap {
+		bestHash, bestHeight, err := chain.GetBestBlock()
+		if err != nil {
+			return err
+		}
+
+		r.bestHeights[hash] = uint32(bestHeight)
+
+		if err := r.syncGraphWithChain(hash, *bestHash); err != nil {
 			return err
 		}
 	}
@@ -362,22 +368,15 @@ func (r *ChannelRouter) Stop() error {
 // the latest UTXO set state. This process involves pruning from the channel
 // graph any channels which have been closed by spending their funding output
 // since we've been down.
-func (r *ChannelRouter) syncGraphWithChain(hash chainhash.Hash) error {
+func (r *ChannelRouter) syncGraphWithChain(hash, bestHash chainhash.Hash) error {
 	chain := r.cfg.ChainMap[hash]
 	chainView := r.cfg.ChainViewMap[hash]
 
-	// First, we'll need to check to see if we're already in sync with the
-	// latest state of the UTXO set.
-	bestHash, bestHeight, err := chain.GetBestBlock()
-	if err != nil {
-		return err
-	}
+	r.bestMtx.RLock()
+	bestHeight := r.bestHeights[hash]
+	r.bestMtx.RUnlock()
 
-	r.bestMtx.Lock()
-	r.bestHeights[hash] = uint32(bestHeight)
-	r.bestMtx.Unlock()
-
-	pruneHash, pruneHeight, err := r.cfg.Graph.PruneTip()
+	pruneHash, pruneHeight, err := r.cfg.Graph.PruneTip(hash)
 	if err != nil {
 		switch {
 		// If the graph has never been pruned, or hasn't fully been
@@ -420,12 +419,12 @@ func (r *ChannelRouter) syncGraphWithChain(hash chainhash.Hash) error {
 			"(hash=%v)", pruneHeight, pruneHash)
 		// Prune the graph for every channel that was opened at height
 		// >= pruneHeight.
-		_, err := r.cfg.Graph.DisconnectBlockAtHeight(pruneHeight)
+		_, err := r.cfg.Graph.DisconnectBlockAtHeight(hash, pruneHeight)
 		if err != nil {
 			return err
 		}
 
-		pruneHash, pruneHeight, err = r.cfg.Graph.PruneTip()
+		pruneHash, pruneHeight, err = r.cfg.Graph.PruneTip(hash)
 		if err != nil {
 			switch {
 			// If at this point the graph has never been pruned, we
@@ -479,9 +478,8 @@ func (r *ChannelRouter) syncGraphWithChain(hash chainhash.Hash) error {
 		// With the spent outputs gathered, attempt to prune the
 		// channel graph, also passing in the hash+height of the block
 		// being pruned so the prune tip can be updated.
-		closedChans, err := r.cfg.Graph.PruneGraph(spentOutputs,
-			nextHash,
-			nextHeight)
+		closedChans, err := r.cfg.Graph.PruneGraph(hash,
+			spentOutputs, nextHash, nextHeight)
 		if err != nil {
 			return err
 		}
@@ -677,7 +675,8 @@ func (r *ChannelRouter) networkHandler(hash chainhash.Hash) {
 
 			// Update the channel graph to reflect that this block
 			// was disconnected.
-			_, err := r.cfg.Graph.DisconnectBlockAtHeight(blockHeight)
+			_, err := r.cfg.Graph.DisconnectBlockAtHeight(hash,
+				blockHeight)
 			if err != nil {
 				log.Errorf("unable to prune graph with stale "+
 					"block: %v", err)
@@ -727,8 +726,9 @@ func (r *ChannelRouter) networkHandler(hash chainhash.Hash) {
 			// the channel graph, also passing in the hash+height
 			// of the block being pruned so the prune tip can be
 			// updated.
-			chansClosed, err := r.cfg.Graph.PruneGraph(spentOutputs,
-				&chainUpdate.Hash, chainUpdate.Height)
+			chansClosed, err := r.cfg.Graph.PruneGraph(hash,
+				spentOutputs, &chainUpdate.Hash,
+				chainUpdate.Height)
 			if err != nil {
 				log.Errorf("unable to prune routing table: %v", err)
 				continue
@@ -1383,6 +1383,8 @@ func (r *ChannelRouter) SendPayment(payment *LightningPayment) ([32]byte, *Route
 	// calculate the required HTLC time locks within the route.
 	currentHeights := r.CurrentBlockHeights()
 
+	log.Infof("Finding route with current heights=%v", currentHeights)
+
 	var finalCLTVDelta uint16
 	if payment.FinalCLTVDelta == nil {
 		finalCLTVDelta = DefaultFinalCLTVDelta
@@ -1794,8 +1796,8 @@ func (r *ChannelRouter) UpdateEdge(update *channeldb.ChannelEdgePolicy) error {
 //
 // NOTE: This method is part of the ChannelGraphSource interface.
 func (r *ChannelRouter) CurrentBlockHeights() map[chainhash.Hash]uint32 {
-	r.bestMtx.Lock()
-	defer r.bestMtx.Unlock()
+	r.bestMtx.RLock()
+	defer r.bestMtx.RUnlock()
 
 	bestHeights := make(map[chainhash.Hash]uint32)
 	for hash, bestHeight := range r.bestHeights {
