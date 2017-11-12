@@ -567,7 +567,6 @@ func newServer(listenAddrs []string, chanDB *channeldb.DB,
 
 	realms := universe.Realms()
 
-	chainHashes := make(map[chainhash.Hash]struct{})
 	chainRealmMap := make(map[chainhash.Hash]byte)
 	for _, realmCode := range realms {
 		hash, err := universe.Hash(realmCode)
@@ -575,7 +574,6 @@ func newServer(listenAddrs []string, chanDB *channeldb.DB,
 			return nil, fmt.Errorf("unknown realm code: %v",
 				realmCode)
 		}
-		chainHashes[*hash] = struct{}{}
 		chainRealmMap[*hash] = realmCode.Byte()
 	}
 
@@ -601,7 +599,7 @@ func newServer(listenAddrs []string, chanDB *channeldb.DB,
 		},
 		ChannelPruneExpiry: time.Duration(time.Hour * 24 * 14),
 		GraphPruneInterval: time.Duration(time.Hour),
-		ChainRealmMap:      chainRealmMap,
+		ChainRealmMap:      universe.ChainRealmMap(),
 	})
 	if err != nil {
 		return nil, fmt.Errorf("can't create router: %v", err)
@@ -677,10 +675,10 @@ func (s *server) Start() error {
 	if err := s.services.StartOnChain(); err != nil {
 		return err
 	}
-	if err := s.authGossiper.Start(); err != nil {
+	if err := s.chanRouter.Start(); err != nil {
 		return err
 	}
-	if err := s.chanRouter.Start(); err != nil {
+	if err := s.authGossiper.Start(); err != nil {
 		return err
 	}
 
