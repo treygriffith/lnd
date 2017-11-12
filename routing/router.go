@@ -63,7 +63,7 @@ type ChannelGraphSource interface {
 
 	// CurrentBlockHeight returns the block height from POV of the router
 	// subsystem.
-	CurrentBlockHeight() (uint32, error)
+	CurrentBlockHeights() map[chainhash.Hash]uint32
 
 	// GetChannelByID return the channel by the channel id.
 	GetChannelByID(chanID lnwire.ShortChannelID) (*channeldb.ChannelEdgeInfo,
@@ -167,6 +167,7 @@ type ChannelRouter struct {
 	started uint32
 	stopped uint32
 
+	bestMtx     sync.RWMutex
 	bestHeights map[chainhash.Hash]uint32
 
 	// cfg is a copy of the configuration struct that the ChannelRouter was
@@ -192,11 +193,11 @@ type ChannelRouter struct {
 	// newBlocks is a channel in which new blocks connected to the end of
 	// the main chain are sent over, and blocks updated after a call to
 	// UpdateFilter.
-	newBlocks <-chan *chainview.FilteredBlock
+	newBlocks map[chainhash.Hash]<-chan *chainview.FilteredBlock
 
 	// staleBlocks is a channel in which blocks disconnected fromt the end
 	// of our currently known best chain are sent over.
-	staleBlocks <-chan *chainview.FilteredBlock
+	staleBlocks map[chainhash.Hash]<-chan *chainview.FilteredBlock
 
 	// networkUpdates is a channel that carries new topology updates
 	// messages from outside the ChannelRouter to be processed by the
@@ -247,6 +248,9 @@ func New(cfg Config) (*ChannelRouter, error) {
 
 	return &ChannelRouter{
 		cfg:               &cfg,
+		bestHeights:       make(map[chainhash.Hash]uint32),
+		newBlocks:         make(map[chainhash.Hash]<-chan *chainview.FilteredBlock),
+		staleBlocks:       make(map[chainhash.Hash]<-chan *chainview.FilteredBlock),
 		networkUpdates:    make(chan *routingMsg),
 		topologyClients:   make(map[uint64]*topologyClient),
 		ntfnClientUpdates: make(chan *topologyClientUpdate),
@@ -270,49 +274,29 @@ func (r *ChannelRouter) Start() error {
 
 	// First, we'll start the chain view instance (if it isn't already
 	// started).
-	if err := r.cfg.ChainView.Start(); err != nil {
-		return err
+	for _, chainView := range r.cfg.ChainViewMap {
+		if err := chainView.Start(); err != nil {
+			return err
+		}
 	}
 
 	// Once the instance is active, we'll fetch the channel we'll receive
 	// notifications over.
-	for _, cv := range r.cfg.ChainViewMap {
-		r.wg.Add(1)
-		go func(fcv chainview.FilteredChainView) {
-			defer r.wg.Done()
-
-			select {
-			case nb, ok := <-fcv.FilteredBlocks():
-				if !ok {
-					return
-				}
-
-				select {
-				case r.newBlocks <- nb:
-				case r.quit:
-				}
-			case <-r.quit:
-			}
-		}(cv)
+	for hash, chainView := range r.cfg.ChainViewMap {
+		r.newBlocks[hash] = chainView.FilteredBlocks()
+		r.staleBlocks[hash] = chainView.DisconnectedBlocks()
 	}
-	for _, cv := range r.cfg.ChainViewMap {
-		r.wg.Add(1)
-		go func(fcv chainview.FilteredChainView) {
-			defer r.wg.Done()
 
-			select {
-			case sb, ok := <-fcv.DisconnectedBlocks():
-				if !ok {
-					return
-				}
-
-				select {
-				case r.staleBlocks <- sb:
-				case r.quit:
-				}
-			case <-r.quit:
-			}
-		}(cv)
+	_, pruneHeight, err := r.cfg.Graph.PruneTip()
+	if err != nil {
+		switch {
+		// If the graph has never been pruned, or hasn't fully been
+		// created yet, then we don't treat this as an explicit error.
+		case err == channeldb.ErrGraphNeverPruned:
+		case err == channeldb.ErrGraphNotFound:
+		default:
+			return err
+		}
 	}
 
 	// Before we perform our manual block pruning, we'll construct and
@@ -324,16 +308,10 @@ func (r *ChannelRouter) Start() error {
 		return err
 	}
 
-	for hash, cv := range r.cfg.ChainViewMap {
+	for _, chainView := range r.cfg.ChainViewMap {
 		log.Infof("Filtering chain using %v channels active", len(channelView))
 
-		bestHeight, ok := r.bestHeights[hash]
-		if !ok {
-			r.bestHeights[hash] = 0
-			bestHeight = 0
-		}
-
-		err = cv.UpdateFilter(channelView, bestHeight)
+		err = chainView.UpdateFilter(channelView, pruneHeight)
 		if err != nil {
 			return err
 		}
@@ -341,12 +319,19 @@ func (r *ChannelRouter) Start() error {
 
 	// Before we begin normal operation of the router, we first need to
 	// synchronize the channel graph to the latest state of the UTXO set.
-	if err := r.syncGraphWithChain(); err != nil {
-		return err
+	for hash := range r.cfg.ChainMap {
+		if err := r.syncGraphWithChain(hash); err != nil {
+			return err
+		}
+	}
+
+	for hash := range r.cfg.ChainMap {
+		r.wg.Add(1)
+		go r.networkHandler(hash)
 	}
 
 	r.wg.Add(1)
-	go r.networkHandler()
+	go r.updateHandler()
 
 	return nil
 }
@@ -361,8 +346,10 @@ func (r *ChannelRouter) Stop() error {
 
 	log.Infof("Channel Router shutting down")
 
-	if err := r.cfg.ChainView.Stop(); err != nil {
-		return err
+	for _, chainView := range r.cfg.ChainViewMap {
+		if err := chainView.Stop(); err != nil {
+			return err
+		}
 	}
 
 	close(r.quit)
@@ -375,130 +362,135 @@ func (r *ChannelRouter) Stop() error {
 // the latest UTXO set state. This process involves pruning from the channel
 // graph any channels which have been closed by spending their funding output
 // since we've been down.
-func (r *ChannelRouter) syncGraphWithChain() error {
-	for hash, chain := range r.cfg.ChainMap {
-		// First, we'll need to check to see if we're already in sync with the
-		// latest state of the UTXO set.
-		bestHash, bestHeight, err := chain.GetBestBlock()
+func (r *ChannelRouter) syncGraphWithChain(hash chainhash.Hash) error {
+	chain := r.cfg.ChainMap[hash]
+	chainView := r.cfg.ChainViewMap[hash]
+
+	// First, we'll need to check to see if we're already in sync with the
+	// latest state of the UTXO set.
+	bestHash, bestHeight, err := chain.GetBestBlock()
+	if err != nil {
+		return err
+	}
+
+	r.bestMtx.Lock()
+	r.bestHeights[hash] = uint32(bestHeight)
+	r.bestMtx.Unlock()
+
+	pruneHash, pruneHeight, err := r.cfg.Graph.PruneTip()
+	if err != nil {
+		switch {
+		// If the graph has never been pruned, or hasn't fully been
+		// created yet, then we don't treat this as an explicit error.
+		case err == channeldb.ErrGraphNeverPruned:
+		case err == channeldb.ErrGraphNotFound:
+		default:
+			return err
+		}
+	}
+
+	log.Infof("Prune tip for Channel Graph: height=%v, hash=%v", pruneHeight,
+		pruneHash)
+
+	switch {
+
+	// If the graph has never been pruned, then we can exit early as this
+	// entails it's being created for the first time and hasn't seen any
+	// block or created channels.
+	case pruneHeight == 0 || pruneHash == nil:
+		return nil
+
+	// If the block hashes and heights match exactly, then we don't need to
+	// prune the channel graph as we're already fully in sync.
+	case bestHash.IsEqual(pruneHash) && uint32(bestHeight) == pruneHeight:
+		return nil
+	}
+
+	// If the main chain blockhash at prune height is different from the
+	// prune hash, this might indicate the database is on a stale branch.
+	mainBlockHash, err := chain.GetBlockHash(int64(pruneHeight))
+	if err != nil {
+		return err
+	}
+
+	// While we are on a stale branch of the chain, walk backwards to find
+	// first common block.
+	for !pruneHash.IsEqual(mainBlockHash) {
+		log.Infof("channel graph is stale. Disconnecting block %v "+
+			"(hash=%v)", pruneHeight, pruneHash)
+		// Prune the graph for every channel that was opened at height
+		// >= pruneHeight.
+		_, err := r.cfg.Graph.DisconnectBlockAtHeight(pruneHeight)
 		if err != nil {
 			return err
 		}
-		r.bestHeights[hash] = uint32(bestHeight)
-		pruneHash, pruneHeight, err := r.cfg.Graph.PruneTip()
+
+		pruneHash, pruneHeight, err = r.cfg.Graph.PruneTip()
 		if err != nil {
 			switch {
-			// If the graph has never been pruned, or hasn't fully been
-			// created yet, then we don't treat this as an explicit error.
+			// If at this point the graph has never been pruned, we
+			// can exit as this entails we are back to the point
+			// where it hasn't seen any block or created channels,
+			// alas there's nothing left to prune.
 			case err == channeldb.ErrGraphNeverPruned:
+				return nil
 			case err == channeldb.ErrGraphNotFound:
+				return nil
 			default:
 				return err
 			}
 		}
-
-		log.Infof("Prune tip for Channel Graph: height=%v, hash=%v", pruneHeight,
-			pruneHash)
-
-		switch {
-
-		// If the graph has never been pruned, then we can exit early as this
-		// entails it's being created for the first time and hasn't seen any
-		// block or created channels.
-		case pruneHeight == 0 || pruneHash == nil:
-			return nil
-
-		// If the block hashes and heights match exactly, then we don't need to
-		// prune the channel graph as we're already fully in sync.
-		case bestHash.IsEqual(pruneHash) && uint32(bestHeight) == pruneHeight:
-			return nil
+		mainBlockHash, err = chain.GetBlockHash(int64(pruneHeight))
+		if err != nil {
+			return err
 		}
+	}
 
-		// If the main chain blockhash at prune height is different from the
-		// prune hash, this might indicate the database is on a stale branch.
-		mainBlockHash, err := r.cfg.Chain.GetBlockHash(int64(pruneHeight))
+	log.Infof("Syncing channel graph from height=%v (hash=%v) to height=%v "+
+		"(hash=%v)", pruneHeight, pruneHash, bestHeight, bestHash)
+
+	// If we're not yet caught up, then we'll walk forward in the chain in
+	// the chain pruning the channel graph with each new block in the chain
+	// that hasn't yet been consumed by the channel graph.
+	var numChansClosed uint32
+	for nextHeight := pruneHeight + 1; nextHeight <= uint32(bestHeight); nextHeight++ {
+		// Using the next height, request a manual block pruning from
+		// the chainview for the particular block hash.
+		nextHash, err := chain.GetBlockHash(int64(nextHeight))
+		if err != nil {
+			return err
+		}
+		filterBlock, err := chainView.FilterBlock(nextHash)
 		if err != nil {
 			return err
 		}
 
-		// While we are on a stale branch of the chain, walk backwards to find
-		// first common block.
-		for !pruneHash.IsEqual(mainBlockHash) {
-			log.Infof("channel graph is stale. Disconnecting block %v "+
-				"(hash=%v)", pruneHeight, pruneHash)
-			// Prune the graph for every channel that was opened at height
-			// >= pruneHeight.
-			_, err := r.cfg.Graph.DisconnectBlockAtHeight(pruneHeight)
-			if err != nil {
-				return err
-			}
-
-			pruneHash, pruneHeight, err = r.cfg.Graph.PruneTip()
-			if err != nil {
-				switch {
-				// If at this point the graph has never been pruned, we
-				// can exit as this entails we are back to the point
-				// where it hasn't seen any block or created channels,
-				// alas there's nothing left to prune.
-				case err == channeldb.ErrGraphNeverPruned:
-					return nil
-				case err == channeldb.ErrGraphNotFound:
-					return nil
-				default:
-					return err
-				}
-			}
-			mainBlockHash, err = r.cfg.Chain.GetBlockHash(int64(pruneHeight))
-			if err != nil {
-				return err
+		// We're only interested in all prior outputs that've been
+		// spent in the block, so collate all the referenced previous
+		// outpoints within each tx and input.
+		var spentOutputs []*wire.OutPoint
+		for _, tx := range filterBlock.Transactions {
+			for _, txIn := range tx.TxIn {
+				spentOutputs = append(spentOutputs,
+					&txIn.PreviousOutPoint)
 			}
 		}
 
-		log.Infof("Syncing channel graph from height=%v (hash=%v) to height=%v "+
-			"(hash=%v)", pruneHeight, pruneHash, bestHeight, bestHash)
-
-		// If we're not yet caught up, then we'll walk forward in the chain in
-		// the chain pruning the channel graph with each new block in the chain
-		// that hasn't yet been consumed by the channel graph.
-		var numChansClosed uint32
-		for nextHeight := pruneHeight + 1; nextHeight <= uint32(bestHeight); nextHeight++ {
-			// Using the next height, request a manual block pruning from
-			// the chainview for the particular block hash.
-			nextHash, err := r.cfg.Chain.GetBlockHash(int64(nextHeight))
-			if err != nil {
-				return err
-			}
-			filterBlock, err := r.cfg.ChainView.FilterBlock(nextHash)
-			if err != nil {
-				return err
-			}
-
-			// We're only interested in all prior outputs that've been
-			// spent in the block, so collate all the referenced previous
-			// outpoints within each tx and input.
-			var spentOutputs []*wire.OutPoint
-			for _, tx := range filterBlock.Transactions {
-				for _, txIn := range tx.TxIn {
-					spentOutputs = append(spentOutputs,
-						&txIn.PreviousOutPoint)
-				}
-			}
-
-			// With the spent outputs gathered, attempt to prune the
-			// channel graph, also passing in the hash+height of the block
-			// being pruned so the prune tip can be updated.
-			closedChans, err := r.cfg.Graph.PruneGraph(spentOutputs,
-				nextHash,
-				nextHeight)
-			if err != nil {
-				return err
-			}
-
-			numClosed := uint32(len(closedChans))
-			log.Infof("Block %v (height=%v) closed %v channels",
-				nextHash, nextHeight, numClosed)
-
-			numChansClosed += numClosed
+		// With the spent outputs gathered, attempt to prune the
+		// channel graph, also passing in the hash+height of the block
+		// being pruned so the prune tip can be updated.
+		closedChans, err := r.cfg.Graph.PruneGraph(spentOutputs,
+			nextHash,
+			nextHeight)
+		if err != nil {
+			return err
 		}
+
+		numClosed := uint32(len(closedChans))
+		log.Infof("Block %v (height=%v) closed %v channels",
+			nextHash, nextHeight, numClosed)
+
+		numChansClosed += numClosed
 	}
 
 	log.Infof("Graph pruning complete: %v channels we're closed since "+
@@ -506,13 +498,7 @@ func (r *ChannelRouter) syncGraphWithChain() error {
 	return nil
 }
 
-// networkHandler is the primary goroutine for the ChannelRouter. The roles of
-// this goroutine include answering queries related to the state of the
-// network, pruning the graph on new block notification, applying network
-// updates, and registering new topology clients.
-//
-// NOTE: This MUST be run as a goroutine.
-func (r *ChannelRouter) networkHandler() {
+func (r *ChannelRouter) updateHandler() {
 	defer r.wg.Done()
 
 	graphPruneTicker := time.NewTicker(r.cfg.GraphPruneInterval)
@@ -551,100 +537,6 @@ func (r *ChannelRouter) networkHandler() {
 			// TODO(roasbeef): remove all unconnected vertexes
 			// after N blocks pass with no corresponding
 			// announcements.
-
-		case chainUpdate, ok := <-r.staleBlocks:
-			// If the channel has been closed, then this indicates
-			// the daemon is shutting down, so we exit ourselves.
-			if !ok {
-				return
-			}
-
-			// Since this block is stale, we update our best height
-			// to the previous block.
-			blockHeight := uint32(chainUpdate.Height)
-			r.bestHeight = blockHeight - 1
-
-			// Update the channel graph to reflect that this block
-			// was disconnected.
-			_, err := r.cfg.Graph.DisconnectBlockAtHeight(blockHeight)
-			if err != nil {
-				log.Errorf("unable to prune graph with stale "+
-					"block: %v", err)
-				continue
-			}
-
-			// Invalidate the route cache, as some channels might
-			// not be confirmed anymore.
-			r.routeCacheMtx.Lock()
-			r.routeCache = make(map[routeTuple][]*Route)
-			r.routeCacheMtx.Unlock()
-
-			// TODO(halseth): notify client about the reorg?
-
-		// A new block has arrived, so we can prune the channel graph
-		// of any channels which were closed in the block.
-		case chainUpdate, ok := <-r.newBlocks:
-			// If the channel has been closed, then this indicates
-			// the daemon is shutting down, so we exit ourselves.
-			if !ok {
-				return
-			}
-
-			// Once a new block arrives, we update our running
-			// track of the height of the chain tip.
-			blockHeight := uint32(chainUpdate.Height)
-			r.bestHeight = blockHeight
-			log.Infof("Pruning channel graph using block %v (height=%v)",
-				chainUpdate.Hash, blockHeight)
-
-			// We're only interested in all prior outputs that've
-			// been spent in the block, so collate all the
-			// referenced previous outpoints within each tx and
-			// input.
-			var spentOutputs []*wire.OutPoint
-			for _, tx := range chainUpdate.Transactions {
-				for _, txIn := range tx.TxIn {
-					spentOutputs = append(spentOutputs,
-						&txIn.PreviousOutPoint)
-				}
-			}
-
-			// With the spent outputs gathered, attempt to prune
-			// the channel graph, also passing in the hash+height
-			// of the block being pruned so the prune tip can be
-			// updated.
-			chansClosed, err := r.cfg.Graph.PruneGraph(spentOutputs,
-				&chainUpdate.Hash, chainUpdate.Height)
-			if err != nil {
-				log.Errorf("unable to prune routing table: %v", err)
-				continue
-			}
-
-			log.Infof("Block %v (height=%v) closed %v channels",
-				chainUpdate.Hash, blockHeight, len(chansClosed))
-
-			// Invalidate the route cache as the block height has
-			// changed which will invalidate the HTLC timeouts we
-			// have crafted within each of the pre-computed routes.
-			//
-			// TODO(roasbeef): need to invalidate after each
-			// chan ann update?
-			//  * can have map of chanID to routes involved, avoids
-			//    full invalidation
-			r.routeCacheMtx.Lock()
-			r.routeCache = make(map[routeTuple][]*Route)
-			r.routeCacheMtx.Unlock()
-
-			if len(chansClosed) == 0 {
-				continue
-			}
-
-			// Notify all currently registered clients of the newly
-			// closed channels.
-			closeSummaries := createCloseSummaries(blockHeight, chansClosed...)
-			r.notifyTopologyChange(&TopologyChange{
-				ClosedChannels: closeSummaries,
-			})
 
 		// A new notification client update has arrived. We're either
 		// gaining a new client, or cancelling notifications for an
@@ -749,6 +641,125 @@ func (r *ChannelRouter) networkHandler() {
 				}
 			}
 
+		case <-r.quit:
+			return
+		}
+	}
+}
+
+// networkHandler is the primary goroutine for the ChannelRouter. The roles of
+// this goroutine include answering queries related to the state of the
+// network, pruning the graph on new block notification, applying network
+// updates, and registering new topology clients.
+//
+// NOTE: This MUST be run as a goroutine.
+func (r *ChannelRouter) networkHandler(hash chainhash.Hash) {
+	defer r.wg.Done()
+
+	newBlocks := r.newBlocks[hash]
+	staleBlocks := r.staleBlocks[hash]
+
+	for {
+		select {
+		case chainUpdate, ok := <-staleBlocks:
+			// If the channel has been closed, then this indicates
+			// the daemon is shutting down, so we exit ourselves.
+			if !ok {
+				return
+			}
+
+			// Since this block is stale, we update our best height
+			// to the previous block.
+			blockHeight := uint32(chainUpdate.Height)
+			r.bestMtx.Lock()
+			r.bestHeights[hash] = blockHeight - 1
+			r.bestMtx.Unlock()
+
+			// Update the channel graph to reflect that this block
+			// was disconnected.
+			_, err := r.cfg.Graph.DisconnectBlockAtHeight(blockHeight)
+			if err != nil {
+				log.Errorf("unable to prune graph with stale "+
+					"block: %v", err)
+				continue
+			}
+
+			// Invalidate the route cache, as some channels might
+			// not be confirmed anymore.
+			r.routeCacheMtx.Lock()
+			r.routeCache = make(map[routeTuple][]*Route)
+			r.routeCacheMtx.Unlock()
+
+			// TODO(halseth): notify client about the reorg?
+
+		// A new block has arrived, so we can prune the channel graph
+		// of any channels which were closed in the block.
+		case chainUpdate, ok := <-newBlocks:
+			// If the channel has been closed, then this indicates
+			// the daemon is shutting down, so we exit ourselves.
+			if !ok {
+				return
+			}
+
+			// Once a new block arrives, we update our running
+			// track of the height of the chain tip.
+			blockHeight := uint32(chainUpdate.Height)
+			r.bestMtx.Lock()
+			r.bestHeights[hash] = blockHeight
+			r.bestMtx.Unlock()
+
+			log.Infof("Pruning channel graph using block %v (height=%v)",
+				chainUpdate.Hash, blockHeight)
+
+			// We're only interested in all prior outputs that've
+			// been spent in the block, so collate all the
+			// referenced previous outpoints within each tx and
+			// input.
+			var spentOutputs []*wire.OutPoint
+			for _, tx := range chainUpdate.Transactions {
+				for _, txIn := range tx.TxIn {
+					spentOutputs = append(spentOutputs,
+						&txIn.PreviousOutPoint)
+				}
+			}
+
+			// With the spent outputs gathered, attempt to prune
+			// the channel graph, also passing in the hash+height
+			// of the block being pruned so the prune tip can be
+			// updated.
+			chansClosed, err := r.cfg.Graph.PruneGraph(spentOutputs,
+				&chainUpdate.Hash, chainUpdate.Height)
+			if err != nil {
+				log.Errorf("unable to prune routing table: %v", err)
+				continue
+			}
+
+			log.Infof("Block %v (height=%v) closed %v channels",
+				chainUpdate.Hash, blockHeight, len(chansClosed))
+
+			// Invalidate the route cache as the block height has
+			// changed which will invalidate the HTLC timeouts we
+			// have crafted within each of the pre-computed routes.
+			//
+			// TODO(roasbeef): need to invalidate after each
+			// chan ann update?
+			//  * can have map of chanID to routes involved, avoids
+			//    full invalidation
+			r.routeCacheMtx.Lock()
+			r.routeCache = make(map[routeTuple][]*Route)
+			r.routeCacheMtx.Unlock()
+
+			if len(chansClosed) == 0 {
+				continue
+			}
+
+			// Notify all currently registered clients of the newly
+			// closed channels.
+			closeSummaries := createCloseSummaries(blockHeight, chansClosed...)
+			r.notifyTopologyChange(&TopologyChange{
+				ClosedChannels: closeSummaries,
+			})
+
 		// The router has been signalled to exit, to we exit our main
 		// loop so the wait group can be decremented.
 		case <-r.quit:
@@ -844,11 +855,17 @@ func (r *ChannelRouter) processUpdate(msg interface{}) error {
 			}
 		}
 
+		chain, ok := r.cfg.ChainMap[msg.ChainHash]
+		if !ok {
+			return errors.Errorf("unable to get chain control for "+
+				"chain=%v", msg.ChainHash)
+		}
+
 		// Before we can add the channel to the channel graph, we need
 		// to obtain the full funding outpoint that's encoded within
 		// the channel ID.
 		channelID := lnwire.NewShortChanIDFromInt(msg.ChannelID)
-		fundingPoint, err := r.fetchChanPoint(&channelID)
+		fundingPoint, err := r.fetchChanPoint(chain, &channelID)
 		if err != nil {
 			return errors.Errorf("unable to fetch chan point for "+
 				"chan_id=%v: %v", msg.ChannelID, err)
@@ -857,7 +874,7 @@ func (r *ChannelRouter) processUpdate(msg interface{}) error {
 		// Now that we have the funding outpoint of the channel, ensure
 		// that it hasn't yet been spent. If so, then this channel has
 		// been closed so we'll ignore it.
-		chanUtxo, err := r.cfg.Chain.GetUtxo(fundingPoint,
+		chanUtxo, err := chain.GetUtxo(fundingPoint,
 			channelID.BlockHeight)
 		if err != nil {
 			return errors.Errorf("unable to fetch utxo for "+
@@ -908,8 +925,23 @@ func (r *ChannelRouter) processUpdate(msg interface{}) error {
 		// update the current UTXO filter within our active
 		// FilteredChainView so we are notified if/when this channel is
 		// closed.
+
+		r.bestMtx.RLock()
+		bestHeight, ok := r.bestHeights[msg.ChainHash]
+		r.bestMtx.RUnlock()
+		if !ok {
+			return errors.Errorf("unable to get best height for "+
+				"chain=%v", msg.ChainHash)
+		}
+
+		chainView, ok := r.cfg.ChainViewMap[msg.ChainHash]
+		if !ok {
+			return errors.Errorf("unable to get chain view for "+
+				"chain=%v", msg.ChainHash)
+		}
+
 		filterUpdate := []wire.OutPoint{*fundingPoint}
-		err = r.cfg.ChainView.UpdateFilter(filterUpdate, r.bestHeight)
+		err = chainView.UpdateFilter(filterUpdate, bestHeight)
 		if err != nil {
 			return errors.Errorf("unable to update chain "+
 				"view: %v", err)
@@ -956,18 +988,29 @@ func (r *ChannelRouter) processUpdate(msg interface{}) error {
 		}
 
 		if !exists {
+			edgeInfo, _, _, err := r.GetChannelByID(channelID)
+			if err != nil {
+				return errors.Errorf("unable to load channel with "+
+					"chanid=%v", err)
+			}
+
+			chain, ok := r.cfg.ChainMap[edgeInfo.ChainHash]
+			if !ok {
+				return errors.Errorf("unable to get chain control "+
+					"for chain=%v", chain)
+			}
+
 			// Before we can update the channel information, we'll
 			// ensure that the target channel is still open by
 			// querying the utxo-set for its existence.
-			chanPoint, err := r.fetchChanPoint(&channelID)
+			chanPoint, err := r.fetchChanPoint(chain, &channelID)
 			if err != nil {
 				return errors.Errorf("unable to fetch chan "+
 					"point for chan_id=%v: %v",
 					msg.ChannelID, err)
 			}
-			_, err = r.cfg.Chain.GetUtxo(
-				chanPoint, channelID.BlockHeight,
-			)
+
+			_, err = chain.GetUtxo(chanPoint, channelID.BlockHeight)
 			if err != nil {
 				return errors.Errorf("unable to fetch utxo for "+
 					"chan_id=%v: %v", msg.ChannelID, err)
@@ -1008,15 +1051,17 @@ func (r *ChannelRouter) processUpdate(msg interface{}) error {
 //
 // TODO(roasbeef): replace with call to GetBlockTransaction? (would allow to
 // later use getblocktxn)
-func (r *ChannelRouter) fetchChanPoint(chanID *lnwire.ShortChannelID) (*wire.OutPoint, error) {
+func (r *ChannelRouter) fetchChanPoint(chain lnwallet.BlockChainIO,
+	chanID *lnwire.ShortChannelID) (*wire.OutPoint, error) {
+
 	// First fetch the block hash by the block number encoded, then use
 	// that hash to fetch the block itself.
 	blockNum := int64(chanID.BlockHeight)
-	blockHash, err := r.cfg.Chain.GetBlockHash(blockNum)
+	blockHash, err := chain.GetBlockHash(blockNum)
 	if err != nil {
 		return nil, err
 	}
-	fundingBlock, err := r.cfg.Chain.GetBlock(blockHash)
+	fundingBlock, err := chain.GetBlock(blockHash)
 	if err != nil {
 		return nil, err
 	}
@@ -1141,10 +1186,7 @@ func (r *ChannelRouter) FindRoutes(target *btcec.PublicKey,
 
 	// We'll also fetch the current block height so we can properly
 	// calculate the required HTLC time locks within the route.
-	_, currentHeight, err := r.cfg.Chain.GetBestBlock()
-	if err != nil {
-		return nil, err
-	}
+	currentHeights := r.CurrentBlockHeights()
 
 	tx, err := r.cfg.Graph.Database().Begin(false)
 	if err != nil {
@@ -1176,7 +1218,7 @@ func (r *ChannelRouter) FindRoutes(target *btcec.PublicKey,
 		// hop in the path as it contains a "self-hop" that is inserted
 		// by our KSP algorithm.
 		route, err := newRoute(amt, sourceVertex, path[1:],
-			uint32(currentHeight), finalCLTVDelta)
+			currentHeights, finalCLTVDelta)
 
 		if err != nil {
 			continue
@@ -1339,10 +1381,7 @@ func (r *ChannelRouter) SendPayment(payment *LightningPayment) ([32]byte, *Route
 
 	// We'll also fetch the current block height so we can properly
 	// calculate the required HTLC time locks within the route.
-	_, currentHeight, err := r.cfg.Chain.GetBestBlock()
-	if err != nil {
-		return preImage, nil, err
-	}
+	currentHeights := r.CurrentBlockHeights()
 
 	var finalCLTVDelta uint16
 	if payment.FinalCLTVDelta == nil {
@@ -1359,7 +1398,7 @@ func (r *ChannelRouter) SendPayment(payment *LightningPayment) ([32]byte, *Route
 		// state of the channel graph and our past HTLC routing
 		// successes/failures.
 		route, err := r.missionControl.RequestRoute(payment,
-			uint32(currentHeight), finalCLTVDelta)
+			currentHeights, finalCLTVDelta)
 		if err != nil {
 			// If we're unable to successfully make a payment using
 			// any of the routes we've found, then return an error.
@@ -1754,9 +1793,16 @@ func (r *ChannelRouter) UpdateEdge(update *channeldb.ChannelEdgePolicy) error {
 // CurrentBlockHeight returns the block height from POV of the router subsystem.
 //
 // NOTE: This method is part of the ChannelGraphSource interface.
-func (r *ChannelRouter) CurrentBlockHeight() (uint32, error) {
-	_, height, err := r.cfg.Chain.GetBestBlock()
-	return uint32(height), err
+func (r *ChannelRouter) CurrentBlockHeights() map[chainhash.Hash]uint32 {
+	r.bestMtx.Lock()
+	defer r.bestMtx.Unlock()
+
+	bestHeights := make(map[chainhash.Hash]uint32)
+	for hash, bestHeight := range r.bestHeights {
+		bestHeights[hash] = bestHeight
+	}
+
+	return bestHeights
 }
 
 // GetChannelByID return the channel by the channel id.
