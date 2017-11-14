@@ -38,6 +38,8 @@ type pendingPayment struct {
 	preimage chan [sha256.Size]byte
 	err      chan error
 
+	source lnwire.ShortChannelID
+
 	// deobfuscator is an serializable entity which is used if we received
 	// an error, it deobfuscates the onion failure blob, and extracts the
 	// exact error from it.
@@ -178,6 +180,13 @@ func New(cfg Config) *Switch {
 func (s *Switch) SendHTLC(nextNode [33]byte, htlc *lnwire.UpdateAddHTLC,
 	deobfuscator ErrorDecrypter) ([sha256.Size]byte, error) {
 
+	log.Infof("Setting first hop destination to: %v", htlc.ChanID)
+
+	source, err := s.getLink(htlc.ChanID)
+	if err != nil {
+		return zeroPreimage, err
+	}
+
 	// Create payment and add to the map of payment in order later to be
 	// able to retrieve it and return response to the user.
 	payment := &pendingPayment{
@@ -185,6 +194,7 @@ func (s *Switch) SendHTLC(nextNode [33]byte, htlc *lnwire.UpdateAddHTLC,
 		preimage:     make(chan [sha256.Size]byte, 1),
 		paymentHash:  htlc.PaymentHash,
 		amount:       htlc.Amount,
+		source:       source.ShortChanID(),
 		deobfuscator: deobfuscator,
 	}
 
@@ -196,7 +206,7 @@ func (s *Switch) SendHTLC(nextNode [33]byte, htlc *lnwire.UpdateAddHTLC,
 	// Generate and send new update packet, if error will be received on
 	// this stage it means that packet haven't left boundaries of our
 	// system and something wrong happened.
-	packet := newInitPacket(nextNode, htlc)
+	packet := newInitPacket(nextNode, source.ShortChanID(), htlc)
 	if err := s.forward(packet); err != nil {
 		s.removePendingPayment(payment.amount, payment.paymentHash)
 		return zeroPreimage, err
@@ -205,7 +215,6 @@ func (s *Switch) SendHTLC(nextNode [33]byte, htlc *lnwire.UpdateAddHTLC,
 	// Returns channels so that other subsystem might wait/skip the
 	// waiting of handling of payment.
 	var preimage [sha256.Size]byte
-	var err error
 
 	select {
 	case e := <-payment.err:
@@ -339,10 +348,14 @@ func (s *Switch) handleLocalDispatch(payment *pendingPayment, packet *htlcPacket
 	// User have created the htlc update therefore we should find the
 	// appropriate channel link and send the payment over this link.
 	case *lnwire.UpdateAddHTLC:
+		log.Infof("packet src=%v dest=%v destNode=%v amt=%v",
+			packet.src, htlc.ChanID, packet.destNode, htlc.Amount)
+
 		// Try to find links by node destination.
-		links, err := s.getLinks(packet.destNode)
+		ilinks, err := s.getLinks(packet.destNode)
 		if err != nil {
-			log.Errorf("unable to find links by destination %v", err)
+			log.Errorf("unable to retrieve links to destination %v",
+				err)
 			return &ForwardingError{
 				ErrorSource:    s.cfg.SelfKey,
 				FailureMessage: &lnwire.FailUnknownNextPeer{},
@@ -351,17 +364,15 @@ func (s *Switch) handleLocalDispatch(payment *pendingPayment, packet *htlcPacket
 
 		// Try to find destination channel link with appropriate
 		// bandwidth.
-		var (
-			destination      ChannelLink
-			largestBandwidth lnwire.MilliSatoshi
-		)
-		for _, link := range links {
-			bandwidth := link.Bandwidth()
-			if bandwidth > largestBandwidth {
-				largestBandwidth = bandwidth
+		var destination ChannelLink
+		for _, link := range ilinks {
+			log.Infof("Found short=%v link=%v, bandwidth=%v",
+				link.ShortChanID(), link.ChanID(), link.Bandwidth())
+			if link.ChanID() != htlc.ChanID {
+				continue
 			}
 
-			if bandwidth >= htlc.Amount {
+			if link.Bandwidth() >= htlc.Amount {
 				destination = link
 				break
 			}
@@ -373,7 +384,7 @@ func (s *Switch) handleLocalDispatch(payment *pendingPayment, packet *htlcPacket
 		if destination == nil {
 			err := fmt.Errorf("insufficient capacity in available "+
 				"outgoing links: need %v, max available is %v",
-				htlc.Amount, largestBandwidth)
+				htlc.Amount, 0)
 			log.Error(err)
 
 			htlcErr := lnwire.NewTemporaryChannelFailure(nil)
@@ -439,6 +450,9 @@ func (s *Switch) handlePacketForward(packet *htlcPacket) error {
 	// payment circuit within our internal state so we can properly forward
 	// the ultimate settle message back latter.
 	case *lnwire.UpdateAddHTLC:
+		log.Infof("packet src=%v dest=%v destNode=%v amt=%v",
+			packet.src, packet.dest, packet.destNode, htlc.Amount)
+
 		source, err := s.getLinkByShortID(packet.src)
 		if err != nil {
 			err := errors.Errorf("unable to find channel link "+
@@ -473,12 +487,19 @@ func (s *Switch) handlePacketForward(packet *htlcPacket) error {
 			log.Error(err)
 			return err
 		}
-		interfaceLinks, _ := s.getLinks(targetLink.Peer().PubKey())
+
+		ilinks, _ := s.getLinks(targetLink.Peer().PubKey())
 
 		// Try to find destination channel link with appropriate
 		// bandwidth.
 		var destination ChannelLink
-		for _, link := range interfaceLinks {
+		for _, link := range ilinks {
+			log.Infof("Found link=%v, bandwidth=%v",
+				link.ShortChanID(), link.Bandwidth())
+			if link.ShortChanID() != packet.dest {
+				continue
+			}
+
 			if link.Bandwidth() >= htlc.Amount {
 				destination = link
 				break
@@ -684,31 +705,39 @@ func (s *Switch) htlcForwarder() {
 				amount      lnwire.MilliSatoshi
 			)
 
+			log.Debugf("HTLC received: %v", spew.Sdump(cmd.pkt))
+
 			// Only three types of message should be forwarded:
 			// add, fails, and settles. Anything else is an error.
 			switch m := cmd.pkt.htlc.(type) {
 			case *lnwire.UpdateAddHTLC:
 				paymentHash = m.PaymentHash
 				amount = m.Amount
+
+				payment, err := s.findPayment(amount, paymentHash)
+				switch {
+				case err == nil && cmd.pkt.dest == payment.source:
+					cmd.err <- s.handleLocalDispatch(payment,
+						cmd.pkt)
+				default:
+					cmd.err <- s.handlePacketForward(cmd.pkt)
+				}
+
 			case *lnwire.UpdateFufillHTLC, *lnwire.UpdateFailHTLC:
 				paymentHash = cmd.pkt.payHash
 				amount = cmd.pkt.amount
+
+				payment, err := s.findPayment(amount, paymentHash)
+				switch {
+				case err == nil && cmd.pkt.src == payment.source:
+					cmd.err <- s.handleLocalDispatch(payment,
+						cmd.pkt)
+				default:
+					cmd.err <- s.handlePacketForward(cmd.pkt)
+				}
 			default:
 				cmd.err <- errors.New("wrong type of update")
 				return
-			}
-
-			// If we can locate this packet in our local records,
-			// then this means a local sub-system initiated it.
-			// Otherwise, this is just a packet to be forwarded, so
-			// we'll treat it as so.
-			//
-			// TODO(roasbeef): can fast path this
-			payment, err := s.findPayment(amount, paymentHash)
-			if err != nil {
-				cmd.err <- s.handlePacketForward(cmd.pkt)
-			} else {
-				cmd.err <- s.handleLocalDispatch(payment, cmd.pkt)
 			}
 
 		// The log ticker has fired, so we'll calculate some forwarding
