@@ -48,9 +48,12 @@ type htlcPacket struct {
 
 // newInitPacket creates htlc switch add packet which encapsulates the add htlc
 // request and additional information for proper forwarding over htlc switch.
-func newInitPacket(destNode [33]byte, htlc *lnwire.UpdateAddHTLC) *htlcPacket {
+func newInitPacket(destNode [33]byte, dest lnwire.ShortChannelID,
+	htlc *lnwire.UpdateAddHTLC) *htlcPacket {
+
 	return &htlcPacket{
 		destNode: destNode,
+		dest:     dest,
 		htlc:     htlc,
 	}
 }
