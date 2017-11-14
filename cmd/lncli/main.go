@@ -182,6 +182,7 @@ func main() {
 		getChanInfoCommand,
 		getNodeInfoCommand,
 		queryRoutesCommand,
+		querySwapRoutesCommand,
 		getNetworkInfoCommand,
 		debugLevelCommand,
 		decodePayReqComamnd,
