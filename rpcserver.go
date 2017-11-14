@@ -1532,7 +1532,13 @@ func (r *rpcServer) SendToRoute(sendToStream lnrpc.Lightning_SendToRouteServer) 
 					}
 				}
 
-				rpcsLog.Infof("send to routes: %v", spew.Sdump(routes))
+				for i, route := range routes {
+					for j, hop := range route.Hops {
+						rpcsLog.Infof("route[%d]: "+
+							"hop=%d expiry=%v",
+							i, j, hop.OutgoingTimeLock)
+					}
+				}
 
 				preImage, route, err := r.server.chanRouter.SendToRoutes(routes, p)
 				if err != nil {
@@ -1605,6 +1611,8 @@ func (r *rpcServer) SendPayment(paymentStream lnrpc.Lightning_SendPaymentServer)
 	for i := 0; i < numOutstandingPayments; i++ {
 		htlcSema <- struct{}{}
 	}
+
+	ltndLog.Infof("SENDING PAYMENT")
 
 	// Launch a new goroutine to handle reading new payment requests from
 	// the client. This way we can handle errors independently of blocking
@@ -2652,6 +2660,85 @@ func (r *rpcServer) QueryRoutes(ctx context.Context,
 	return routeResp, nil
 }
 
+// QueryRoutes attempts to query the daemons' Channel Router for a possible
+// route to a target destination capable of carrying a specific amount of
+// satoshis within the route's flow. The retuned route contains the full
+// details required to craft and send an HTLC, also including the necessary
+// information that should be present within the Sphinx packet encapsualted
+// within the HTLC.
+//
+// TODO(roasbeef): should return a slice of routes in reality
+//  * create separate PR to send based on well formatted route
+func (r *rpcServer) QuerySwapRoutes(ctx context.Context,
+	in *lnrpc.QuerySwapRoutesRequest) (*lnrpc.QueryRoutesResponse,
+	error) {
+
+	// Check macaroon to see if this is allowed.
+	if r.authSvc != nil {
+		if err := macaroons.ValidateMacaroon(ctx, "queryswaproutes",
+			r.authSvc); err != nil {
+			return nil, err
+		}
+	}
+
+	// First parse the hex-encdoed public key into a full public key objet
+	// we can properly manipulate.
+	pubKeyBytes, err := hex.DecodeString(in.PubKey)
+	if err != nil {
+		return nil, err
+	}
+	pubKey, err := btcec.ParsePubKey(pubKeyBytes, btcec.S256())
+	if err != nil {
+		return nil, err
+	}
+
+	inRealm, err := realm.CodeFromStr(in.InTicker)
+	if err != nil {
+		return nil, err
+	}
+	outRealm, err := realm.CodeFromStr(in.OutTicker)
+	if err != nil {
+		return nil, err
+	}
+
+	inNet := htlcswitch.NetworkHop(inRealm)
+	outNet := htlcswitch.NetworkHop(outRealm)
+
+	// Currently, within the bootstrap phase of the network, we limit the
+	// largest payment size allotted to (2^32) - 1 mSAT or 4.29 million
+	// satoshis.
+	amt := btcutil.Amount(in.InAmt)
+	amtMSat := lnwire.NewMSatFromSatoshis(amt)
+	if amtMSat > maxPaymentMSat {
+		return nil, fmt.Errorf("payment of %v is too large, max payment "+
+			"allowed is %v", amt, maxPaymentMSat.ToSatoshis())
+	}
+
+	amtIn := routing.Currency{
+		MilliSatoshi: amtMSat,
+		Network:      inNet,
+	}
+
+	// Query the channel router for a possible path to the destination that
+	// can carry `in.Amt` satoshis _including_ the total fee required on
+	// the route.
+	routes, err := r.server.chanRouter.FindSwapRoutes(pubKey, amtIn, outNet)
+	if err != nil {
+		return nil, err
+	}
+
+	// For each valid route, we'll convert the result into the format
+	// required by the RPC system.
+	routeResp := &lnrpc.QueryRoutesResponse{
+		Routes: make([]*lnrpc.Route, len(routes)),
+	}
+	for i, route := range routes {
+		routeResp.Routes[i] = marshalRoute(route)
+	}
+
+	return routeResp, nil
+}
+
 func marshalRoute(route *routing.Route) *lnrpc.Route {
 	resp := &lnrpc.Route{
 		TotalTimeLock: route.TotalTimeLock,
@@ -2665,7 +2752,7 @@ func marshalRoute(route *routing.Route) *lnrpc.Route {
 			ChanCapacity: int64(hop.Channel.Capacity),
 			AmtToForward: int64(hop.AmtToForward.ToSatoshis()),
 			Fee:          int64(hop.Fee.ToSatoshis()),
-			Expiry:       uint32(hop.OutgoingTimeLock),
+			Expiry:       hop.OutgoingTimeLock,
 		}
 	}
 
@@ -2673,6 +2760,8 @@ func marshalRoute(route *routing.Route) *lnrpc.Route {
 }
 
 func unmarshalRoute(rpcroute *lnrpc.Route, graph *channeldb.ChannelGraph) (*routing.Route, error) {
+	rpcsLog.Infof("rpcroute: %v", spew.Sdump(rpcroute))
+
 	route := &routing.Route{
 		TotalTimeLock: rpcroute.TotalTimeLock,
 		TotalFees:     lnwire.NewMSatFromSatoshis(btcutil.Amount(rpcroute.TotalFees)),
@@ -2706,15 +2795,19 @@ func unmarshalRoute(rpcroute *lnrpc.Route, graph *channeldb.ChannelGraph) (*rout
 			return nil, fmt.Errorf("could not find channel edge for hop=%d", i)
 		}
 
+		chanID := lnwire.NewChanIDFromOutPoint(
+			&edgeInfo.ChannelPoint)
+
 		routingHop := &routing.ChannelHop{
 			ChannelEdgePolicy: channelEdgePolicy,
 			Capacity:          btcutil.Amount(hop.ChanCapacity),
 			Chain:             edgeInfo.ChainHash,
+			ChanID:            chanID,
 		}
 
 		route.Hops[i] = &routing.Hop{
 			Channel:          routingHop,
-			OutgoingTimeLock: uint32(routingHop.TimeLockDelta),
+			OutgoingTimeLock: hop.Expiry,
 			AmtToForward:     lnwire.NewMSatFromSatoshis(btcutil.Amount(hop.AmtToForward)),
 			Fee:              lnwire.NewMSatFromSatoshis(btcutil.Amount(hop.Fee)),
 		}
