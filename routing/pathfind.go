@@ -11,6 +11,7 @@ import (
 	"github.com/boltdb/bolt"
 	"github.com/lightningnetwork/lightning-onion"
 	"github.com/lightningnetwork/lnd/channeldb"
+	"github.com/lightningnetwork/lnd/htlcswitch"
 	"github.com/lightningnetwork/lnd/lnwire"
 	"github.com/roasbeef/btcd/btcec"
 	"github.com/roasbeef/btcd/chaincfg/chainhash"
@@ -49,6 +50,8 @@ type ChannelHop struct {
 	Chain chainhash.Hash
 
 	*channeldb.ChannelEdgePolicy
+
+	ChanID lnwire.ChannelID
 }
 
 // Hop represents the forwarding details at a particular position within the
@@ -186,6 +189,9 @@ func (r *Route) ToHopPayloads(
 	// package.
 	for i, hop := range r.Hops {
 		log.Infof("forwarding to chain: %v", hop.Channel.Chain)
+		log.Infof("forwarding with amt: %v", hop.AmtToForward)
+		log.Infof("forwarding with cltv: %v", hop.OutgoingTimeLock)
+
 		realmByte, ok := chainRealmMap[hop.Channel.Chain]
 		if !ok {
 			return nil, ErrUnknownNextRealm
@@ -214,6 +220,178 @@ func (r *Route) ToHopPayloads(
 	}
 
 	return hopPayloads, nil
+}
+
+func newSwapRoute(amtIn Currency, sourceVertex vertex,
+	pathEdges []*ChannelHop, currentHeights map[chainhash.Hash]uint32,
+	exchangeRates map[chainhash.Hash]map[chainhash.Hash]float64,
+	interRealmTimeScale map[chainhash.Hash]map[chainhash.Hash]float64,
+	finalCLTVDelta uint16) (*Route, error) {
+
+	// First, we'll create a new empty route with enough hops to match the
+	// amount of path edges. We set the TotalTimeLock to the current block
+	// height, as this is the basis that all of the time locks will be
+	// calculated from.
+	route := &Route{
+		Hops:       make([]*Hop, len(pathEdges)),
+		nodeIndex:  make(map[vertex]struct{}),
+		chanIndex:  make(map[uint64]struct{}),
+		nextHopMap: make(map[vertex]*ChannelHop),
+	}
+
+	// TODO(roasbeef): need to do sanity check to ensure we don't make a
+	// "dust" payment: over x% of money sending to fees
+
+	// We'll populate the next hop map for the _source_ node with the
+	// information for the first hop so the mapping is sound.
+	route.nextHopMap[sourceVertex] = pathEdges[0]
+
+	// The running amount is the total amount of satoshis required at this
+	// point in the route. We start this value at the amount we want to
+	// send to the destination. This value will then get successively
+	// larger as we compute the fees going backwards.
+	runningAmt := amtIn.MilliSatoshi
+	pathLength := len(pathEdges)
+	for i := pathLength - 1; i >= 0; i-- {
+		edge := pathEdges[i]
+
+		// First, we'll update both the node and channel index, to
+		// indicate that this vertex, and outgoing channel link are
+		// present within this route.
+		v := newVertex(edge.Node.PubKey)
+		route.nodeIndex[v] = struct{}{}
+		route.chanIndex[edge.ChannelID] = struct{}{}
+
+		// If this isn't a direct payment, and this isn't the last hop
+		// in the route, then we'll also populate the nextHop map to
+		// allow easy route traversal by callers.
+		if len(pathEdges) > 1 && i != len(pathEdges)-1 {
+			route.nextHopMap[v] = route.Hops[i+1].Channel
+		}
+
+		// Now we'll start to calculate the items within the per-hop
+		// payload for this current hop.
+		//
+		// If this is the last hop, then we send the exact amount and
+		// pay no fee, as we're paying directly to the receiver, and
+		// there're no additional hops.
+		amtToForward := runningAmt
+		fee := lnwire.MilliSatoshi(0)
+
+		// If this isn't the last hop, to add enough funds to pay for
+		// transit over the next link.
+		if i != len(pathEdges)-1 {
+
+			// We'll grab the edge policy and per-hop payload of
+			// the prior hop so we can calculate fees properly.
+			prevEdge := pathEdges[i+1]
+			prevHop := route.Hops[i+1]
+
+			if edge.Chain != prevEdge.Chain {
+				exgRate := exchangeRates[prevEdge.Chain][edge.Chain]
+
+				runningAmt = lnwire.MilliSatoshi(
+					float64(prevHop.AmtToForward) * exgRate)
+
+				amtToForward = runningAmt
+
+			} else {
+				// The fee for this hop, will be based on how
+				// much the prior hop carried, as we'll need to
+				// increase the amount of satoshis incoming into
+				// this hop to properly pay the required fees.
+				prevAmount := prevHop.AmtToForward
+				fee = computeFee(prevAmount, prevEdge)
+
+				// With the fee computed, we increment the total
+				// amount as we need to pay this fee. This value
+				// represents the amount of funds that will come
+				// _into_ this edge.
+				runningAmt += fee
+
+				// Otherwise, for a node to forward an HTLC,
+				// then following inequality most hold true:
+				//
+				//     * amt_in - fee >= amt_to_forward
+				amtToForward = runningAmt - fee
+			}
+		}
+
+		// Now we create the hop struct for this point in the route.
+		// The amount to forward is the running amount, and we compute
+		// the required fee based on this amount.
+		nextHop := &Hop{
+			Channel:      edge,
+			AmtToForward: amtToForward,
+			Fee:          fee,
+		}
+		edge.Node.PubKey.Curve = nil
+
+		// As a sanity check, we ensure that the selected channel has
+		// enough capacity to forward the required amount which
+		// includes the fee dictated at each hop.
+		if nextHop.AmtToForward.ToSatoshis() > nextHop.Channel.Capacity {
+			err := fmt.Sprintf("channel graph has insufficient "+
+				"capacity for the payment: need %v, have %v",
+				nextHop.AmtToForward.ToSatoshis(),
+				nextHop.Channel.Capacity)
+
+			return nil, newErrf(ErrInsufficientCapacity, err)
+		}
+
+		// If this is the last hop, then for verification purposes, the
+		// value of the outgoing time-lock should be _exactly_ the
+		// absolute time out they'd expect in the HTLC.
+		if i == len(pathEdges)-1 {
+			// As this is the last hop, we'll use the specified
+			// final CLTV delta value instead of the value from the
+			// last link in the route.
+			chainHeight := currentHeights[edge.Chain]
+
+			route.TotalTimeLock = chainHeight + uint32(finalCLTVDelta)
+			nextHop.OutgoingTimeLock = chainHeight + uint32(finalCLTVDelta)
+
+		} else {
+			// We'll grab the edge policy so we can calculate
+			// timeouts properly.
+			prevEdge := pathEdges[i+1]
+
+			// If we have switched chains, adjust the total timelock
+			// to be in terms of this new chain height.
+			if edge.Chain != prevEdge.Chain {
+				timeScale := interRealmTimeScale[prevEdge.Chain][edge.Chain]
+
+				prevHeight := currentHeights[prevEdge.Chain]
+				nowHeight := currentHeights[edge.Chain]
+
+				relTotalTimeLock := route.TotalTimeLock - prevHeight
+
+				route.TotalTimeLock = nowHeight + uint32(
+					float64(relTotalTimeLock)*timeScale)
+			}
+
+			// Next, increment the total timelock of the entire
+			// route such that each hops time lock increases as we
+			// walk backwards in the route, using the delta of the
+			// previous hop.
+			route.TotalTimeLock += uint32(edge.TimeLockDelta)
+
+			// Otherwise, the value of the outgoing time-lock will
+			// be the value of the time-lock for the _outgoing_
+			// HTLC, so we factor in their specified grace period
+			// (time lock delta).
+			nextHop.OutgoingTimeLock = route.TotalTimeLock -
+				uint32(edge.TimeLockDelta)
+		}
+
+		route.Hops[i] = nextHop
+	}
+
+	// The total amount required for this route will be the value the
+	// source extends to the first hop in the route.
+	route.TotalAmount = runningAmt
+
+	return route, nil
 }
 
 // newRoute returns a fully valid route between the source and target that's
@@ -397,6 +575,368 @@ func edgeWeight(e *channeldb.ChannelEdgePolicy) float64 {
 	return float64(1 + e.TimeLockDelta)
 }
 
+func findRealmPaths(tx *bolt.Tx, graph *channeldb.ChannelGraph,
+	source *channeldb.LightningNode,
+	target *btcec.PublicKey, amt Currency,
+	chainRealmMap map[chainhash.Hash]byte) ([][]*ChannelHop, error) {
+
+	// TODO(roasbeef): take in db tx
+
+	ignoredEdges := make(map[uint64]struct{})
+	ignoredVertexes := make(map[vertex]struct{})
+
+	// TODO(roasbeef): modifying ordering within heap to eliminate final
+	// sorting step?
+	var (
+		shortestPaths  [][]*ChannelHop
+		candidatePaths pathHeap
+	)
+
+	// First we'll find a single shortest path from the source (our
+	// selfNode) to the target destination that's capable of carrying amt
+	// satoshis along the path before fees are calculated.
+	startingPath, err := findRealmPath(tx, graph, source, target,
+		ignoredVertexes, ignoredEdges, amt, chainRealmMap)
+	if err != nil {
+		log.Errorf("Unable to find path: %v", err)
+		return nil, err
+	}
+
+	// Manually insert a "self" edge emanating from ourselves. This
+	// self-edge is required in order for the path finding algorithm to
+	// function properly.
+	firstPath := make([]*ChannelHop, 0, len(startingPath)+1)
+	firstPath = append(firstPath, &ChannelHop{
+		ChannelEdgePolicy: &channeldb.ChannelEdgePolicy{
+			Node: source,
+		},
+	})
+	firstPath = append(firstPath, startingPath...)
+
+	shortestPaths = append(shortestPaths, firstPath)
+
+	source.PubKey.Curve = nil
+
+	// While we still have candidate paths to explore we'll keep exploring
+	// the sub-graphs created to find the next k-th shortest path.
+	for k := 1; k < 10; k++ {
+		prevShortest := shortestPaths[k-1]
+
+		// We'll examine each edge in the previous iteration's shortest
+		// path in order to find path deviations from each node in the
+		// path.
+		for i := 0; i < len(prevShortest)-1; i++ {
+			// These two maps will mark the edges and vertexes
+			// we'll exclude from the next path finding attempt.
+			// These are required to ensure the paths are unique
+			// and loopless.
+			ignoredEdges = make(map[uint64]struct{})
+			ignoredVertexes = make(map[vertex]struct{})
+
+			// Our spur node is the i-th node in the prior shortest
+			// path, and our root path will be all nodes in the
+			// path leading up to our spurNode.
+			spurNode := prevShortest[i].Node
+			rootPath := prevShortest[:i+1]
+
+			// Before we kickoff our next path finding iteration,
+			// we'll find all the edges we need to ignore in this
+			// next round.
+			for _, path := range shortestPaths {
+				// If our current rootPath is a prefix of this
+				// shortest path, then we'll remove the edge
+				// directly _after_ our spur node from the
+				// graph so we don't repeat paths.
+				if len(path) > i+1 && isSamePath(rootPath, path[:i+1]) {
+					ignoredEdges[path[i+1].ChannelID] = struct{}{}
+				}
+			}
+
+			// Next we'll remove all entries in the root path that
+			// aren't the current spur node from the graph.
+			for _, hop := range rootPath {
+				node := hop.Node.PubKey
+				if node.IsEqual(spurNode.PubKey) {
+					continue
+				}
+
+				ignoredVertexes[newVertex(node)] = struct{}{}
+			}
+
+			// With the edges that are part of our root path, and
+			// the vertexes (other than the spur path) within the
+			// root path removed, we'll attempt to find another
+			// shortest path from the spur node to the destination.
+			spurPath, err := findRealmPath(tx, graph, spurNode,
+				target, ignoredVertexes, ignoredEdges, amt,
+				chainRealmMap)
+
+			// If we weren't able to find a path, we'll continue to
+			// the next round.
+			if IsError(err, ErrNoPathFound) {
+				continue
+			} else if err != nil {
+				return nil, err
+			}
+
+			// Create the new combined path by concatenating the
+			// rootPath to the spurPath.
+			newPathLen := len(rootPath) + len(spurPath)
+			newPath := path{
+				hops: make([]*ChannelHop, 0, newPathLen),
+				dist: newPathLen,
+			}
+			newPath.hops = append(newPath.hops, rootPath...)
+			newPath.hops = append(newPath.hops, spurPath...)
+
+			// TODO(roasbeef): add and consult path finger print
+
+			// We'll now add this newPath to the heap of candidate
+			// shortest paths.
+			heap.Push(&candidatePaths, newPath)
+		}
+
+		// If our min-heap of candidate paths is empty, then we can
+		// exit early.
+		if candidatePaths.Len() == 0 {
+			break
+		}
+
+		// To conclude this latest iteration, we'll take the shortest
+		// path in our set of candidate paths and add it to our
+		// shortestPaths list as the *next* shortest path.
+		nextShortestPath := heap.Pop(&candidatePaths).(path).hops
+		shortestPaths = append(shortestPaths, nextShortestPath)
+	}
+
+	return shortestPaths, nil
+}
+
+var ErrNoSwapRoute = errors.New("no valid swap route was found")
+
+func mergeSwapRoutes(outPaths, inPaths [][]*ChannelHop) ([][]*ChannelHop, error) {
+	if len(outPaths) == 0 || len(inPaths) == 0 {
+		return nil, ErrNoSwapRoute
+	}
+
+	log.Debugf("Num in paths: %d", len(inPaths))
+	log.Debugf("Num out paths: %d", len(outPaths))
+
+	nPaths := len(inPaths) * len(outPaths)
+	shortestPaths := make([][]*ChannelHop, 0, nPaths)
+	for _, outPath := range outPaths {
+		if len(outPath) < 2 {
+			continue
+		}
+
+		for _, inPath := range inPaths {
+			if len(inPath) < 2 {
+				continue
+			}
+
+			log.Debugf("Len in path: %d, %v", len(inPath), inPath)
+			log.Debugf("Len out path: %d, %v", len(outPath), outPath)
+			shortestPaths = append(shortestPaths,
+				append(outPath, inPath[1:]...))
+		}
+	}
+
+	return shortestPaths, nil
+}
+
+func findRealmPath(tx *bolt.Tx, graph *channeldb.ChannelGraph,
+	sourceNode *channeldb.LightningNode, target *btcec.PublicKey,
+	ignoredNodes map[vertex]struct{},
+	ignoredEdges map[uint64]struct{}, amt Currency,
+	chainRealmMap map[chainhash.Hash]byte) ([]*ChannelHop, error) {
+
+	var err error
+	if tx == nil {
+		tx, err = graph.Database().Begin(false)
+		if err != nil {
+			return nil, err
+		}
+		defer tx.Rollback()
+	}
+
+	// First we'll initialize an empty heap which'll help us to quickly
+	// locate the next edge we should visit next during our graph
+	// traversal.
+	var nodeHeap distanceHeap
+
+	// For each node/vertex the graph we create an entry in the distance
+	// map for the node set with a distance of "infinity".  We also mark
+	// add the node to our set of unvisited nodes.
+	distance := make(map[vertex]nodeWithDist)
+	if err := graph.ForEachNode(tx, func(_ *bolt.Tx, node *channeldb.LightningNode) error {
+		// TODO(roasbeef): with larger graph can just use disk seeks
+		// with a visited map
+		distance[newVertex(node.PubKey)] = nodeWithDist{
+			dist: infinity,
+			node: node,
+		}
+		return nil
+	}); err != nil {
+		return nil, err
+	}
+
+	// TODO(roasbeef): also add path caching
+	//  * similar to route caching, but doesn't factor in the amount
+
+	// To start, we add the source of our path finding attempt to the
+	// distance map with with a distance of 0. This indicates our starting
+	// point in the graph traversal.
+	sourceVertex := newVertex(sourceNode.PubKey)
+	distance[sourceVertex] = nodeWithDist{
+		dist: 0,
+		node: sourceNode,
+	}
+
+	// To start, our source node will the sole item within our distance
+	// heap.
+	heap.Push(&nodeHeap, distance[sourceVertex])
+
+	// We'll use this map as a series of "previous" hop pointers. So to get
+	// to `vertex` we'll take the edge that it's mapped to within `prev`.
+	prev := make(map[vertex]edgeWithPrev)
+	for nodeHeap.Len() != 0 {
+		// Fetch the node within the smallest distance from our source
+		// from the heap.
+		partialPath := heap.Pop(&nodeHeap).(nodeWithDist)
+		bestNode := partialPath.node
+
+		// If we've reached our target (or we don't have any outgoing
+		// edges), then we're done here and can exit the graph
+		// traversal early.
+		if bestNode.PubKey.IsEqual(target) {
+			break
+		}
+
+		// Now that we've found the next potential step to take we'll
+		// examine all the outgoing edge (channels) from this node to
+		// further our graph traversal.
+		pivot := newVertex(bestNode.PubKey)
+		err := bestNode.ForEachChannel(tx, func(tx *bolt.Tx,
+			edgeInfo *channeldb.ChannelEdgeInfo,
+			outEdge, inEdge *channeldb.ChannelEdgePolicy) error {
+
+			realmByte := chainRealmMap[edgeInfo.ChainHash]
+
+			// Skip if this node is for the wrong currency.
+			if amt.Network != htlcswitch.NetworkHop(realmByte) {
+				return nil
+			}
+
+			v := newVertex(outEdge.Node.PubKey)
+
+			// TODO(roasbeef): skip if chan disabled
+
+			// If this vertex or edge has been black listed, then
+			// we'll skip exploring this edge during this
+			// iteration.
+			if _, ok := ignoredNodes[v]; ok {
+				return nil
+			}
+			if _, ok := ignoredEdges[outEdge.ChannelID]; ok {
+				return nil
+			}
+
+			// Compute the tentative distance to this new
+			// channel/edge which is the distance to our current
+			// pivot node plus the weight of this edge.
+			tempDist := distance[pivot].dist + edgeWeight(outEdge)
+
+			chanID := lnwire.NewChanIDFromOutPoint(
+				&edgeInfo.ChannelPoint)
+
+			log.Infof("Found edge with chanid=%v", chanID)
+
+			// If this new tentative distance is better than the
+			// current best known distance to this node, then we
+			// record the new better distance, and also populate
+			// our "next hop" map with this edge. We'll also shave
+			// off irrelevant edges by adding the sufficient
+			// capacity of an edge to our relaxation condition.
+			if tempDist < distance[v].dist &&
+				edgeInfo.Capacity >= amt.ToSatoshis() {
+
+				// TODO(roasbeef): need to also account
+				// for min HTLC
+
+				distance[v] = nodeWithDist{
+					dist: tempDist,
+					node: outEdge.Node,
+				}
+
+				prev[v] = edgeWithPrev{
+					// We'll use the *incoming* edge here
+					// as we need to use the routing policy
+					// specified by the node this channel
+					// connects to.
+					edge: &ChannelHop{
+						ChannelEdgePolicy: outEdge,
+						Capacity:          edgeInfo.Capacity,
+						Chain:             edgeInfo.ChainHash,
+						ChanID:            chanID,
+					},
+					prevNode: bestNode.PubKey,
+				}
+
+				// Add this new node to our heap as we'd like
+				// to further explore down this edge.
+				heap.Push(&nodeHeap, distance[v])
+			}
+
+			return nil
+		})
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	// If the target node isn't found in the prev hop map, then a path
+	// doesn't exist, so we terminate in an error.
+	if _, ok := prev[newVertex(target)]; !ok {
+		return nil, newErrf(ErrNoPathFound, "unable to find a path to "+
+			"destination")
+	}
+
+	// If the potential route if below the max hop limit, then we'll use
+	// the prevHop map to unravel the path. We end up with a list of edges
+	// in the reverse direction which we'll use to properly calculate the
+	// timelock and fee values.
+	pathEdges := make([]*ChannelHop, 0, len(prev))
+	prevNode := newVertex(target)
+	for prevNode != sourceVertex { // TODO(roasbeef): assumes no cycles
+		// Add the current hop to the limit of path edges then walk
+		// backwards from this hop via the prev pointer for this hop
+		// within the prevHop map.
+		pathEdges = append(pathEdges, prev[prevNode].edge)
+		prev[prevNode].edge.Node.PubKey.Curve = nil
+
+		prevNode = newVertex(prev[prevNode].prevNode)
+	}
+
+	// The route is invalid if it spans more than 20 hops. The current
+	// Sphinx (onion routing) implementation can only encode up to 20 hops
+	// as the entire packet is fixed size. If this route is more than 20
+	// hops, then it's invalid.
+	numEdges := len(pathEdges)
+	if numEdges > HopLimit {
+		return nil, newErr(ErrMaxHopsExceeded, "potential path has "+
+			"too many hops")
+	}
+
+	// As our traversal of the prev map above walked backwards from the
+	// target to the source in the route, we need to reverse it before
+	// returning the final route.
+	for i := 0; i < numEdges/2; i++ {
+		pathEdges[i], pathEdges[numEdges-i-1] = pathEdges[numEdges-i-1], pathEdges[i]
+	}
+
+	return pathEdges, nil
+}
+
 // findPath attempts to find a path from the source node within the
 // ChannelGraph to the target node that's capable of supporting a payment of
 // `amt` value. The current approach implemented is modified version of
@@ -499,6 +1039,9 @@ func findPath(tx *bolt.Tx, graph *channeldb.ChannelGraph,
 			// pivot node plus the weight of this edge.
 			tempDist := distance[pivot].dist + edgeWeight(outEdge)
 
+			chanID := lnwire.NewChanIDFromOutPoint(
+				&edgeInfo.ChannelPoint)
+
 			// If this new tentative distance is better than the
 			// current best known distance to this node, then we
 			// record the new better distance, and also populate
@@ -515,6 +1058,7 @@ func findPath(tx *bolt.Tx, graph *channeldb.ChannelGraph,
 					dist: tempDist,
 					node: outEdge.Node,
 				}
+
 				prev[v] = edgeWithPrev{
 					// We'll use the *incoming* edge here
 					// as we need to use the routing policy
@@ -524,6 +1068,7 @@ func findPath(tx *bolt.Tx, graph *channeldb.ChannelGraph,
 						ChannelEdgePolicy: outEdge,
 						Capacity:          edgeInfo.Capacity,
 						Chain:             edgeInfo.ChainHash,
+						ChanID:            chanID,
 					},
 					prevNode: bestNode.PubKey,
 				}
