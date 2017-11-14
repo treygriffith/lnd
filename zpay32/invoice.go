@@ -9,9 +9,11 @@ import (
 
 	"github.com/lightningnetwork/lnd/lnwire"
 	"github.com/lightningnetwork/lnd/routing"
+	ltcCfg "github.com/ltcsuite/ltcd/chaincfg"
 	"github.com/roasbeef/btcd/btcec"
-	"github.com/roasbeef/btcd/chaincfg"
+	btcCfg "github.com/roasbeef/btcd/chaincfg"
 	"github.com/roasbeef/btcd/chaincfg/chainhash"
+	"github.com/roasbeef/btcd/wire"
 	"github.com/roasbeef/btcutil"
 	"github.com/roasbeef/btcutil/bech32"
 )
@@ -82,7 +84,7 @@ type MessageSigner struct {
 // added to the encoded invoice.
 type Invoice struct {
 	// Net specifies what network this Lightning invoice is meant for.
-	Net *chaincfg.Params
+	Net *btcCfg.Params
 
 	// MilliSat specifies the amount of this invoice in millisatoshi.
 	// Optional.
@@ -236,7 +238,7 @@ func RoutingInfo(routingInfo []ExtraRoutingInfo) func(*Invoice) {
 //
 // NOTE: Either Description  or DescriptionHash must be provided for the Invoice
 // to be considered valid.
-func NewInvoice(net *chaincfg.Params, paymentHash [32]byte,
+func NewInvoice(net *btcCfg.Params, paymentHash [32]byte,
 	timestamp time.Time, options ...func(*Invoice)) (*Invoice, error) {
 
 	invoice := &Invoice{
@@ -281,14 +283,33 @@ func Decode(invoice string) (*Invoice, error) {
 	// The next characters should be a valid prefix for a segwit BIP173
 	// address. This will also determine which network this invoice is
 	// meant for.
-	var net *chaincfg.Params
-	if strings.HasPrefix(hrp[2:], chaincfg.MainNetParams.Bech32HRPSegwit) {
-		net = &chaincfg.MainNetParams
-	} else if strings.HasPrefix(hrp[2:], chaincfg.TestNet3Params.Bech32HRPSegwit) {
-		net = &chaincfg.TestNet3Params
-	} else if strings.HasPrefix(hrp[2:], chaincfg.SimNetParams.Bech32HRPSegwit) {
-		net = &chaincfg.SimNetParams
-	} else {
+	var net *btcCfg.Params
+	switch {
+	case strings.HasPrefix(hrp[2:], btcCfg.MainNetParams.Bech32HRPSegwit):
+		net = &btcCfg.MainNetParams
+
+	case strings.HasPrefix(hrp[2:], btcCfg.TestNet3Params.Bech32HRPSegwit):
+		net = &btcCfg.TestNet3Params
+
+	case strings.HasPrefix(hrp[2:], btcCfg.SimNetParams.Bech32HRPSegwit):
+		net = &btcCfg.SimNetParams
+
+	case strings.HasPrefix(hrp[2:], btcCfg.RegressionNetParams.Bech32HRPSegwit):
+		net = &btcCfg.RegressionNetParams
+
+	case strings.HasPrefix(hrp[2:], ltcCfg.MainNetParams.Bech32HRPSegwit):
+		net = ltcToBtcParams(&ltcCfg.MainNetParams)
+
+	case strings.HasPrefix(hrp[2:], ltcCfg.TestNet4Params.Bech32HRPSegwit):
+		net = ltcToBtcParams(&ltcCfg.TestNet4Params)
+
+	case strings.HasPrefix(hrp[2:], ltcCfg.SimNetParams.Bech32HRPSegwit):
+		net = ltcToBtcParams(&ltcCfg.SimNetParams)
+
+	case strings.HasPrefix(hrp[2:], ltcCfg.RegressionNetParams.Bech32HRPSegwit):
+		net = ltcToBtcParams(&ltcCfg.RegressionNetParams)
+
+	default:
 		return nil, fmt.Errorf("unknown network")
 	}
 	decodedInvoice.Net = net
@@ -409,7 +430,7 @@ func (invoice *Invoice) Encode(signer MessageSigner) (string, error) {
 	}
 
 	// The human-readable part (hrp) is "ln" + net hrp + optional amount.
-	hrp := "ln" + invoice.Net.Bech32HRPSegwit
+	hrp := "ln" + invoice.Net.Bech32HRPSegwit[:2]
 	if invoice.MilliSat != nil {
 		// Encode the amount using the fewest possible characters.
 		am, err := encodeAmount(*invoice.MilliSat)
@@ -546,7 +567,7 @@ func validateInvoice(invoice *Invoice) error {
 
 // parseData parses the data part of the invoice. It expects base32 data
 // returned from the bech32.Decode method, except signature.
-func parseData(invoice *Invoice, data []byte, net *chaincfg.Params) error {
+func parseData(invoice *Invoice, data []byte, net *btcCfg.Params) error {
 	// It must contain the timestamp, encoded using 35 bits (7 groups).
 	if len(data) < timestampBase32Len {
 		return fmt.Errorf("data too short: %d", len(data))
@@ -580,7 +601,7 @@ func parseTimestamp(data []byte) (uint64, error) {
 
 // parseTaggedFields takes the base32 encoded tagged fields of the invoice, and
 // fills the Invoice struct accordingly.
-func parseTaggedFields(invoice *Invoice, fields []byte, net *chaincfg.Params) error {
+func parseTaggedFields(invoice *Invoice, fields []byte, net *btcCfg.Params) error {
 	index := 0
 	for {
 		// If less than 3 groups less, it cannot possibly contain more
@@ -1003,4 +1024,43 @@ func uint64ToBase32(num uint64) []byte {
 
 	// We only return non-zero leading groups.
 	return arr[i:]
+}
+
+func ltcToBtcParams(params *ltcCfg.Params) *btcCfg.Params {
+	p := &btcCfg.Params{}
+
+	p.Name = params.Name
+	p.Net = wire.BitcoinNet(params.Net)
+	p.DefaultPort = params.DefaultPort
+	p.CoinbaseMaturity = params.CoinbaseMaturity
+
+	p.GenesisHash = &chainhash.Hash{}
+	copy(p.GenesisHash[:], params.GenesisHash[:])
+
+	// Address encoding magics
+	p.PubKeyHashAddrID = params.PubKeyHashAddrID
+	p.ScriptHashAddrID = params.ScriptHashAddrID
+	p.PrivateKeyID = params.PrivateKeyID
+	p.WitnessPubKeyHashAddrID = params.WitnessPubKeyHashAddrID
+	p.WitnessScriptHashAddrID = params.WitnessScriptHashAddrID
+	p.Bech32HRPSegwit = params.Bech32HRPSegwit
+
+	copy(p.HDPrivateKeyID[:], params.HDPrivateKeyID[:])
+	copy(p.HDPublicKeyID[:], params.HDPublicKeyID[:])
+
+	p.HDCoinType = params.HDCoinType
+
+	checkPoints := make([]btcCfg.Checkpoint, len(params.Checkpoints))
+	for i := 0; i < len(params.Checkpoints); i++ {
+		var chainHash chainhash.Hash
+		copy(chainHash[:], params.Checkpoints[i].Hash[:])
+
+		checkPoints[i] = btcCfg.Checkpoint{
+			Height: params.Checkpoints[i].Height,
+			Hash:   &chainHash,
+		}
+	}
+	p.Checkpoints = checkPoints
+
+	return p
 }
