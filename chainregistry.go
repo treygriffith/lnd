@@ -32,6 +32,12 @@ var defaultBitcoinForwardingPolicy = htlcswitch.ForwardingPolicy{
 	BaseFee:       lnwire.NewMSatFromSatoshis(1),
 	FeeRate:       1,
 	TimeLockDelta: 144,
+	ExchangeRates: map[htlcswitch.NetworkHop]float64{
+		htlcswitch.LitecoinHop: 100.0,
+	},
+	InterRealmTimeScale: map[htlcswitch.NetworkHop]float64{
+		htlcswitch.LitecoinHop: 4.0,
+	},
 }
 
 // defaultLitecoinForwardingPolicy is the default forwarding policy used for
@@ -41,6 +47,12 @@ var defaultLitecoinForwardingPolicy = htlcswitch.ForwardingPolicy{
 	BaseFee:       1,
 	FeeRate:       1,
 	TimeLockDelta: 576,
+	ExchangeRates: map[htlcswitch.NetworkHop]float64{
+		htlcswitch.BitcoinHop: 0.01,
+	},
+	InterRealmTimeScale: map[htlcswitch.NetworkHop]float64{
+		htlcswitch.BitcoinHop: 0.25,
+	},
 }
 
 // defaultChannelConstraints is the default set of channel constraints that are
