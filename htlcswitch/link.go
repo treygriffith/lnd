@@ -10,6 +10,7 @@ import (
 
 	"crypto/sha256"
 
+	"github.com/davecgh/go-spew/spew"
 	"github.com/go-errors/errors"
 	"github.com/lightningnetwork/lnd/chainntnfs"
 	"github.com/lightningnetwork/lnd/lnwallet"
@@ -63,6 +64,10 @@ type ForwardingPolicy struct {
 	//    per-hop payload of the incoming HTLC's onion packet.
 	TimeLockDelta uint32
 
+	ExchangeRates map[NetworkHop]float64
+
+	InterRealmTimeScale map[NetworkHop]float64
+
 	// TODO(roasbeef): add fee module inside of switch
 }
 
@@ -83,6 +88,15 @@ func ExpectedFee(f ForwardingPolicy, htlcAmt lnwire.MilliSatoshi) lnwire.MilliSa
 // elements within the configuration MUST be non-nil for channel link to carry
 // out its duties.
 type ChannelLinkConfig struct {
+	Network NetworkHop
+
+	// ChainHash indicates the chain on which this link is stationed.
+	ChainHash chainhash.Hash
+
+	KnownRealms map[byte]chainhash.Hash
+
+	CurrentBlockHeights func() map[chainhash.Hash]uint32
+
 	// FwrdingPolicy is the initial forwarding policy to be used when
 	// deciding whether to forwarding incoming HTLC's or not. This value
 	// can be updated with subsequent calls to UpdateForwardingPolicy
@@ -1289,16 +1303,20 @@ func (l *channelLink) processLockedInHtlcs(
 			// constraints have been properly met by by this
 			// incoming HTLC.
 			default:
+
 				// We want to avoid forwarding an HTLC which
 				// will expire in the near future, so we'll
 				// reject an HTLC if its expiration time is too
 				// close to the current height.
 				timeDelta := l.cfg.FwrdingPolicy.TimeLockDelta
+
 				if pd.Timeout-timeDelta <= heightNow {
 					log.Errorf("htlc(%x) has an expiry "+
-						"that's too soon: outgoing_expiry=%v, "+
+						"that's too soon: "+
+						"outgoing_expiry=%v, "+
 						"best_height=%v", pd.RHash[:],
-						pd.Timeout-timeDelta, heightNow)
+						pd.Timeout-timeDelta,
+						heightNow)
 
 					var failure lnwire.FailureMessage
 					update, err := l.cfg.GetLastChannelUpdate()
@@ -1340,14 +1358,21 @@ func (l *channelLink) processLockedInHtlcs(
 					continue
 				}
 
+				log.Debugf("Network: %v", l.cfg.Network)
+				log.Debugf("Fwdinfo: %v", spew.Sdump(fwdInfo))
+				log.Debugf("PD: %v", spew.Sdump(pd))
+
 				// Next, using the amount of the incoming HTLC,
 				// we'll calculate the expected fee this
 				// incoming HTLC must carry in order to be
 				// accepted.
-				expectedFee := ExpectedFee(
-					l.cfg.FwrdingPolicy,
-					fwdInfo.AmountToForward,
-				)
+				var expectedFee lnwire.MilliSatoshi
+				if l.cfg.Network == fwdInfo.Network {
+					expectedFee = ExpectedFee(
+						l.cfg.FwrdingPolicy,
+						fwdInfo.AmountToForward,
+					)
+				}
 
 				// If the amount of the incoming HTLC, minus
 				// our expected fee isn't equal to the
@@ -1414,6 +1439,8 @@ func (l *channelLink) processLockedInHtlcs(
 					continue
 				}
 
+				amount, expiry := l.translateIfInterRealm(fwdInfo)
+
 				// TODO(roasbeef): also add max timeout value
 
 				// With all our forwarding constraints met,
@@ -1421,8 +1448,8 @@ func (l *channelLink) processLockedInHtlcs(
 				// parameters as specified in the forwarding
 				// info.
 				addMsg := &lnwire.UpdateAddHTLC{
-					Expiry:      fwdInfo.OutgoingCTLV,
-					Amount:      fwdInfo.AmountToForward,
+					Expiry:      expiry,
+					Amount:      amount,
 					PaymentHash: pd.RHash,
 				}
 
@@ -1459,6 +1486,36 @@ func (l *channelLink) processLockedInHtlcs(
 	}
 
 	return packetsToForward
+}
+
+func (l *channelLink) translateIfInterRealm(
+	fwdInfo ForwardingInfo) (lnwire.MilliSatoshi, uint32) {
+
+	if fwdInfo.Network == l.cfg.Network {
+		return fwdInfo.AmountToForward, fwdInfo.OutgoingCTLV
+	}
+
+	exgRate := l.cfg.FwrdingPolicy.
+		ExchangeRates[fwdInfo.Network]
+
+	scaledAmount := lnwire.MilliSatoshi(
+		float64(fwdInfo.AmountToForward) * exgRate)
+
+	bestHeights := l.cfg.CurrentBlockHeights()
+
+	destRealm := l.cfg.KnownRealms[byte(fwdInfo.Network)]
+	srcRealm := l.cfg.KnownRealms[byte(l.cfg.Network)]
+
+	destHeight := bestHeights[destRealm]
+	srcHeight := bestHeights[srcRealm]
+
+	timeScale := l.cfg.FwrdingPolicy.
+		InterRealmTimeScale[fwdInfo.Network]
+
+	scaledExpiry := destHeight + uint32(
+		float64(fwdInfo.OutgoingCTLV-srcHeight)*timeScale)
+
+	return scaledAmount, scaledExpiry
 }
 
 // sendHTLCError functions cancels HTLC and send cancel message back to the
