@@ -1801,6 +1801,107 @@ func queryRoutes(ctx *cli.Context) error {
 	return nil
 }
 
+var querySwapRoutesCommand = cli.Command{
+	Name:        "queryswaproutes",
+	Usage:       "Query a swap route to a destination.",
+	Description: "Queries the channel router for a potential path to the destination that has sufficient flow for the amount including fees",
+	ArgsUsage:   "dest in_amt in_ticker out_ticker",
+	Flags: []cli.Flag{
+		cli.StringFlag{
+			Name: "dest",
+			Usage: "the 33-byte hex-encoded public key for the payment " +
+				"destination",
+		},
+		cli.Int64Flag{
+			Name:  "in_amt",
+			Usage: "the amount to receive in in_ticker satoshis",
+		},
+		cli.StringFlag{
+			Name:  "in_ticker",
+			Usage: "the chain on which to receive in_amt satoshis",
+		},
+		cli.StringFlag{
+			Name:  "out_ticker",
+			Usage: "the chain on which to receive the swapped currency",
+		},
+	},
+	Action: querySwapRoutes,
+}
+
+func querySwapRoutes(ctx *cli.Context) error {
+	ctxb := context.Background()
+	client, cleanUp := getClient(ctx)
+	defer cleanUp()
+
+	var (
+		dest      string
+		inAmt     int64
+		inTicker  string
+		outTicker string
+		err       error
+	)
+
+	args := ctx.Args()
+
+	switch {
+	case ctx.IsSet("dest"):
+		dest = ctx.String("dest")
+	case args.Present():
+		dest = args.First()
+		args = args.Tail()
+	default:
+		return fmt.Errorf("dest argument missing")
+	}
+
+	switch {
+	case ctx.IsSet("in_amt"):
+		inAmt = ctx.Int64("in_amt")
+	case args.Present():
+		inAmt, err = strconv.ParseInt(args.First(), 10, 64)
+		if err != nil {
+			return fmt.Errorf("unable to decode amt argument: %v", err)
+		}
+		args = args.Tail()
+	default:
+		return fmt.Errorf("in_amt argument missing")
+	}
+
+	switch {
+	case ctx.IsSet("in_ticker"):
+		inTicker = ctx.String("in_ticker")
+	case args.Present():
+		inTicker = args.First()
+		args = args.Tail()
+	default:
+		return fmt.Errorf("in_ticker argument missing")
+	}
+
+	switch {
+	case ctx.IsSet("out_ticker"):
+		outTicker = ctx.String("out_ticker")
+	case args.Present():
+		outTicker = args.First()
+		args = args.Tail()
+	default:
+		return fmt.Errorf("out_ticker argument missing")
+	}
+
+	req := &lnrpc.QuerySwapRoutesRequest{
+		PubKey:    dest,
+		InAmt:     inAmt,
+		InTicker:  inTicker,
+		OutTicker: outTicker,
+	}
+
+	route, err := client.QuerySwapRoutes(ctxb, req)
+	if err != nil {
+		return err
+	}
+
+	printRespJSON(route)
+	return nil
+}
+
 var getNetworkInfoCommand = cli.Command{
 	Name:  "getnetworkinfo",
 	Usage: "getnetworkinfo",
