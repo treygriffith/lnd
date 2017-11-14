@@ -17,6 +17,14 @@ var bitcoinTestNetParams = realm.Params{
 	Network: realm.TestNet,
 }
 
+// liteTestNetParams contains parameters specific to the 4th version of the
+// test network.
+var litecoinTestNetParams = realm.Params{
+	Params:  ltcToBtcParams(&litecoinCfg.TestNet4Params),
+	RpcPort: "19334",
+	Network: realm.TestNet,
+}
+
 // bitcoinSimNetParams contains parameters specific to the simulation test
 // network.
 var bitcoinSimNetParams = realm.Params{
@@ -25,12 +33,12 @@ var bitcoinSimNetParams = realm.Params{
 	Network: realm.SimNet,
 }
 
-// liteTestNetParams contains parameters specific to the 4th version of the
-// test network.
-var liteTestNetParams = realm.Params{
-	Params:  ltcToBtcParams(&litecoinCfg.TestNet4Params),
-	RpcPort: "19334",
-	Network: realm.TestNet,
+// litecoinSimNetParams contains parameters specific to the simulation test
+// network.
+var litecoinSimNetParams = realm.Params{
+	Params:  ltcToBtcParams(&litecoinCfg.SimNetParams),
+	RpcPort: "19556",
+	Network: realm.SimNet,
 }
 
 // regTestNetParams contains parameters specific to a local regtest network.
