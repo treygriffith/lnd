@@ -12,7 +12,7 @@ import (
 // hop for a forwarded HTLC. The existnce of this field within the
 // ForwardingInfo struct enables the ability for HTLC to cross chain-boundaries
 // at will.
-type NetworkHop uint8
+type NetworkHop byte
 
 const (
 	// BitcoinHop denotes that an HTLC is to be forwarded along the Bitcoin
@@ -34,6 +34,10 @@ func (c NetworkHop) String() string {
 	default:
 		return "Kekcoin"
 	}
+}
+
+func (c NetworkHop) Byte() byte {
+	return byte(c)
 }
 
 var (
@@ -130,7 +134,7 @@ func (r *sphinxHopIterator) ForwardingInstructions() ForwardingInfo {
 	}
 
 	return ForwardingInfo{
-		Network:         BitcoinHop,
+		Network:         NetworkHop(fwdInst.Realm),
 		NextHop:         nextHop,
 		AmountToForward: lnwire.MilliSatoshi(fwdInst.ForwardAmount),
 		OutgoingCTLV:    fwdInst.OutgoingCltv,
