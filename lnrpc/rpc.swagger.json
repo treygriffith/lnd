@@ -397,6 +397,49 @@
         ]
       }
     },
+    "/v1/graph/swaproutes/{pub_key}/{in_amt}/{in_ticker}/{out_ticker}": {
+      "get": {
+        "operationId": "QuerySwapRoutes",
+        "responses": {
+          "200": {
+            "description": "",
+            "schema": {
+              "$ref": "#/definitions/lnrpcQueryRoutesResponse"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "pub_key",
+            "in": "path",
+            "required": true,
+            "type": "string"
+          },
+          {
+            "name": "in_amt",
+            "in": "path",
+            "required": true,
+            "type": "string",
+            "format": "int64"
+          },
+          {
+            "name": "in_ticker",
+            "in": "path",
+            "required": true,
+            "type": "string"
+          },
+          {
+            "name": "out_ticker",
+            "in": "path",
+            "required": true,
+            "type": "string"
+          }
+        ],
+        "tags": [
+          "Lightning"
+        ]
+      }
+    },
     "/v1/invoices": {
       "post": {
         "summary": "* lncli: `addinvoice`\nAddInvoice attempts to add a new invoice to the invoice database. Any\nduplicated invoices are rejected, therefore all invoices *must* have a\nunique payment preimage.",
