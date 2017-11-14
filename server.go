@@ -567,14 +567,46 @@ func newServer(listenAddrs []string, chanDB *channeldb.DB,
 
 	realms := universe.Realms()
 
-	chainRealmMap := make(map[chainhash.Hash]byte)
-	for _, realmCode := range realms {
-		hash, err := universe.Hash(realmCode)
+	exchangeRates := make(map[chainhash.Hash]map[chainhash.Hash]float64)
+	interRealmTimeScale := make(map[chainhash.Hash]map[chainhash.Hash]float64)
+	for _, fromRealm := range realms {
+		fromParams, err := universe.Param(fromRealm)
 		if err != nil {
 			return nil, fmt.Errorf("unknown realm code: %v",
-				realmCode)
+				fromRealm)
 		}
-		chainRealmMap[*hash] = realmCode.Byte()
+		fromHash := fromParams.Params.GenesisHash
+
+		fromCC, err := universe.Control(fromRealm)
+		if err != nil {
+			return nil, fmt.Errorf("unknown realm code: %v",
+				fromRealm)
+		}
+
+		exgRates := fromCC.RoutingPolicy.ExchangeRates
+		timeScales := fromCC.RoutingPolicy.InterRealmTimeScale
+
+		exchangeRates[*fromHash] = make(map[chainhash.Hash]float64)
+		interRealmTimeScale[*fromHash] = make(map[chainhash.Hash]float64)
+
+		for _, toRealm := range realms {
+			if fromRealm == toRealm {
+				continue
+			}
+
+			toParams, err := universe.Param(toRealm)
+			if err != nil {
+				return nil, fmt.Errorf("unknown realm code: %v",
+					toRealm)
+			}
+			toHash := toParams.Params.GenesisHash
+
+			exgRate := exgRates[htlcswitch.NetworkHop(toRealm)]
+			timeScale := timeScales[htlcswitch.NetworkHop(toRealm)]
+
+			exchangeRates[*fromHash][*toHash] = exgRate
+			interRealmTimeScale[*fromHash][*toHash] = timeScale
+		}
 	}
 
 	s.chanRouter, err = routing.New(routing.Config{
@@ -597,9 +629,12 @@ func newServer(listenAddrs []string, chanDB *channeldb.DB,
 
 			return s.htlcSwitch.SendHTLC(firstHopPub, htlcAdd, errorDecryptor)
 		},
-		ChannelPruneExpiry: time.Duration(time.Hour * 24 * 14),
-		GraphPruneInterval: time.Duration(time.Hour),
-		ChainRealmMap:      universe.ChainRealmMap(),
+		ChannelPruneExpiry:  time.Duration(time.Hour * 24 * 14),
+		GraphPruneInterval:  time.Duration(time.Hour),
+		ChainRealmMap:       universe.ChainRealmMap(),
+		RealmChainMap:       universe.RealmChainMap(),
+		ExchangeRates:       exchangeRates,
+		InterRealmTimeScale: interRealmTimeScale,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("can't create router: %v", err)
