@@ -381,6 +381,10 @@ func (p *peer) loadActiveChannels(chans []*channeldb.OpenChannel) error {
 				BaseFee:       selfPolicy.FeeBaseMSat,
 				FeeRate:       selfPolicy.FeeProportionalMillionths,
 				TimeLockDelta: uint32(selfPolicy.TimeLockDelta),
+				ExchangeRates: cs.cc.RoutingPolicy.
+					ExchangeRates,
+				InterRealmTimeScale: cs.cc.RoutingPolicy.
+					InterRealmTimeScale,
 			}
 		} else {
 			forwardingPolicy = &cs.cc.RoutingPolicy
@@ -388,10 +392,17 @@ func (p *peer) loadActiveChannels(chans []*channeldb.OpenChannel) error {
 
 		peerLog.Tracef("Using link policy of: %v", spew.Sdump(forwardingPolicy))
 
+		chainRealmMap := p.server.universe.ChainRealmMap()
+		realmCode := chainRealmMap[dbChan.ChainHash]
+
 		// Register this new channel link with the HTLC Switch. This is
 		// necessary to properly route multi-hop payments, and forward
 		// new payments triggered by RPC clients.
 		linkCfg := htlcswitch.ChannelLinkConfig{
+			Network:               htlcswitch.NetworkHop(realmCode),
+			ChainHash:             dbChan.ChainHash,
+			KnownRealms:           p.server.universe.RealmChainMap(),
+			CurrentBlockHeights:   p.server.chanRouter.CurrentBlockHeights,
 			Peer:                  p,
 			DecodeHopIterator:     p.server.sphinx.DecodeHopIterator,
 			DecodeOnionObfuscator: p.server.sphinx.ExtractErrorEncrypter,
