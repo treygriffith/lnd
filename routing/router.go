@@ -117,6 +117,12 @@ type Config struct {
 	// hops, and set the realm byte on the onion packet accordingly.
 	ChainRealmMap map[chainhash.Hash]byte
 
+	RealmChainMap map[byte]chainhash.Hash
+
+	ExchangeRates map[chainhash.Hash]map[chainhash.Hash]float64
+
+	InterRealmTimeScale map[chainhash.Hash]map[chainhash.Hash]float64
+
 	// SendToSwitch is a function that directs a link-layer switch to
 	// forward a fully encoded payment to the first hop in the route
 	// denoted by its public key. A non-nil error is to be returned if the
@@ -424,19 +430,18 @@ func (r *ChannelRouter) syncGraphWithChain(hash, bestHash chainhash.Hash) error 
 		}
 
 		pruneHash, pruneHeight, err = r.cfg.Graph.PruneTip(hash)
-		if err != nil {
-			switch {
-			// If at this point the graph has never been pruned, we
-			// can exit as this entails we are back to the point
-			// where it hasn't seen any block or created channels,
-			// alas there's nothing left to prune.
-			case err == channeldb.ErrGraphNeverPruned:
-				return nil
-			case err == channeldb.ErrGraphNotFound:
-				return nil
-			default:
-				return err
-			}
+		switch err {
+		case nil:
+		// If at this point the graph has never been pruned, we can exit
+		// as this entails we are back to the point where it hasn't seen
+		// any block or created channels, alas there's nothing left to
+		// prune.
+		case channeldb.ErrGraphNeverPruned:
+			return nil
+		case channeldb.ErrGraphNotFound:
+			return nil
+		default:
+			return err
 		}
 		mainBlockHash, err = chain.GetBlockHash(int64(pruneHeight))
 		if err != nil {
@@ -1131,6 +1136,169 @@ func pruneChannelFromRoutes(routes []*Route, skipChan uint64) []*Route {
 	return prunedRoutes
 }
 
+type Currency struct {
+	lnwire.MilliSatoshi
+
+	Network htlcswitch.NetworkHop
+}
+
+func MakeCurrency(amt lnwire.MilliSatoshi,
+	net htlcswitch.NetworkHop) Currency {
+
+	return Currency{
+		MilliSatoshi: amt,
+		Network:      net,
+	}
+}
+
+func (r *ChannelRouter) FindSwapRoutes(target *btcec.PublicKey,
+	amtIn Currency, net htlcswitch.NetworkHop,
+	finalExpiry ...uint16) ([]*Route, error) {
+
+	if amtIn.Network == net {
+		err := errors.Errorf("Cannot swap currencies on "+
+			"the same network %v", net)
+		log.Debugf(err.Error())
+		return nil, err
+	}
+
+	// finalCLTVDelta in terms of the receiving chain.
+	var finalCLTVDelta uint16
+	if len(finalExpiry) == 0 {
+		finalCLTVDelta = DefaultFinalCLTVDelta
+	} else {
+		finalCLTVDelta = finalExpiry[0]
+	}
+	log.Debugf("Realm chain map: %v", r.cfg.RealmChainMap)
+	log.Debugf("Chain realm map: %v", r.cfg.ChainRealmMap)
+
+	inHash := r.cfg.RealmChainMap[amtIn.Network.Byte()]
+	outHash := r.cfg.RealmChainMap[net.Byte()]
+
+	log.Debugf("In hash: %v", inHash)
+	log.Debugf("Out hash: %v", outHash)
+	log.Debugf("Exchange rates: %v", r.cfg.ExchangeRates)
+
+	exgRate := r.cfg.ExchangeRates[outHash][inHash]
+
+	amtOut := Currency{
+		MilliSatoshi: lnwire.MilliSatoshi(
+			float64(amtIn.MilliSatoshi) * exgRate),
+		Network: net,
+	}
+
+	dest := target.SerializeCompressed()
+	log.Debugf("Searching for swap paths to %x, sending %v, "+
+		"receiving %v", dest, amtOut, amtIn)
+
+	// If we don't have a set of routes cached, we'll query the graph for a
+	// set of potential routes to the destination node that can support our
+	// payment amount. If no such routes can be found then an error will be
+	// returned.
+
+	// We can short circuit the routing by opportunistically checking to
+	// see if the target vertex event exists in the current graph.
+	targetNode, err := r.cfg.Graph.FetchLightningNode(target)
+	switch err {
+	case nil:
+	case channeldb.ErrGraphNotFound, channeldb.ErrGraphNodeNotFound:
+		log.Debugf("Target %x is not in known graph", dest)
+		return nil, newErrf(ErrTargetNotInNetwork, "target not found")
+	default:
+		return nil, err
+	}
+
+	// We'll also fetch the current block height so we can properly
+	// calculate the required HTLC time locks within the route.
+	currentHeights := r.CurrentBlockHeights()
+
+	tx, err := r.cfg.Graph.Database().Begin(false)
+	if err != nil {
+		tx.Rollback()
+		return nil, err
+	}
+
+	inPaths, err := findRealmPaths(tx, r.cfg.Graph, targetNode,
+		r.selfNode.PubKey, amtIn, r.cfg.ChainRealmMap)
+	if err != nil {
+		tx.Rollback()
+		return nil, err
+	}
+
+	// Now that we know the destination is reachable within the graph,
+	// we'll execute our KSP algorithm to find the k-shortest paths from
+	// our source to the destination.
+	outPaths, err := findRealmPaths(tx, r.cfg.Graph, r.selfNode,
+		target, amtOut, r.cfg.ChainRealmMap)
+	if err != nil {
+		tx.Rollback()
+		return nil, err
+	}
+
+	tx.Rollback()
+
+	shortestPaths, err := mergeSwapRoutes(outPaths, inPaths)
+	if err != nil {
+		return nil, err
+	}
+
+	// Now that we have a set of paths, we'll need to turn them into
+	// *routes* by computing the required time-lock and fee information for
+	// each path. During this process, some paths may be discarded if they
+	// aren't able to support the total satoshis flow once fees have been
+	// factored in.
+	validRoutes := make([]*Route, 0, len(shortestPaths))
+	sourceVertex := newVertex(r.selfNode.PubKey)
+	for _, path := range shortestPaths {
+		// Attempt to make the path into a route. We snip off the first
+		// hop in the path as it contains a "self-hop" that is inserted
+		// by our KSP algorithm.
+		route, err := newSwapRoute(amtIn, sourceVertex, path[1:],
+			currentHeights, r.cfg.ExchangeRates,
+			r.cfg.InterRealmTimeScale, finalCLTVDelta)
+
+		if err != nil {
+			continue
+		}
+
+		// If the path as enough total flow to support the computed
+		// route, then we'll add it to our set of valid routes.
+		validRoutes = append(validRoutes, route)
+	}
+
+	// If all our perspective routes were eliminating during the transition
+	// from path to route, then we'll return an error to the caller
+	if len(validRoutes) == 0 {
+		return nil, newErr(ErrNoPathFound, "unable to find a path to "+
+			"destination")
+	}
+
+	// Finally, we'll sort the set of validate routes to optimize for
+	// lowest total fees, using the required time-lock within the
+	// route as a tie-breaker.
+	sort.Slice(validRoutes, func(i, j int) bool {
+		// To make this decision we first check if the total fees
+		// required for both routes are equal. If so, then we'll let
+		// the total time lock be the tie breaker. Otherwise, we'll
+		// put the route with the lowest total fees first.
+		if validRoutes[i].TotalFees == validRoutes[j].TotalFees {
+			timeLockI := validRoutes[i].TotalTimeLock
+			timeLockJ := validRoutes[j].TotalTimeLock
+			return timeLockI < timeLockJ
+		}
+
+		return validRoutes[i].TotalFees < validRoutes[j].TotalFees
+	})
+
+	go log.Tracef("Obtained %v paths sending %v to %x: %v", len(validRoutes),
+		amtOut.MilliSatoshi, dest, newLogClosure(func() string {
+			return spew.Sdump(validRoutes)
+		}),
+	)
+
+	return validRoutes, nil
+}
+
 // FindRoutes attempts to query the ChannelRouter for the all available paths
 // to a particular target destination which is able to send `amt` after
 // factoring in channel capacities and cumulative fees along each route route.
@@ -1428,6 +1596,8 @@ func (r *ChannelRouter) SendPayment(payment *LightningPayment) ([32]byte, *Route
 			return preImage, nil, err
 		}
 
+		firstChanID := route.Hops[0].Channel.ChanID
+
 		// Craft an HTLC packet to send to the layer 2 switch. The
 		// metadata within this packet will be used to route the
 		// payment through the network, starting with the first-hop.
@@ -1435,6 +1605,7 @@ func (r *ChannelRouter) SendPayment(payment *LightningPayment) ([32]byte, *Route
 			Amount:      route.TotalAmount,
 			Expiry:      route.TotalTimeLock,
 			PaymentHash: payment.PaymentHash,
+			ChanID:      firstChanID,
 		}
 		copy(htlcAdd.OnionBlob[:], onionBlob)
 
@@ -1662,6 +1833,8 @@ func (r *ChannelRouter) SendToRoutes(routes []*Route,
 			return preImage, nil, err
 		}
 
+		firstChanID := route.Hops[0].Channel.ChanID
+
 		// Craft an HTLC packet to send to the layer 2 switch. The
 		// metadata within this packet will be used to route the
 		// payment through the network, starting with the first-hop.
@@ -1669,6 +1842,7 @@ func (r *ChannelRouter) SendToRoutes(routes []*Route,
 			Amount:      route.TotalAmount,
 			Expiry:      route.TotalTimeLock,
 			PaymentHash: payment.PaymentHash,
+			ChanID:      firstChanID,
 		}
 		copy(htlcAdd.OnionBlob[:], onionBlob)
 
