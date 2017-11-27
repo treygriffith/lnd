@@ -65,6 +65,12 @@ var (
 	// channel closure. This key should be accessed from within the
 	// sub-bucket of a target channel, identified by its channel point.
 	revocationLogBucket = []byte("revocation-log-key")
+
+	// fwdPackageLogBucket is a bucket that stores the locked-in htlcs after
+	// having received a revocation from the remote party. The keys in this
+	// bucket represent the remote height at which these htlcs were
+	// accepted.
+	fwdPackageLogBucket = []byte("fwd-package-log-key")
 )
 
 var (
@@ -881,6 +887,15 @@ func (c *OpenChannel) AppendRemoteCommitChain(diff *CommitDiff) error {
 			return err
 		}
 
+		fwdLogKey := fwdPackageLogBucket
+		fwdBucket := chanBucket.Bucket(fwdLogKey)
+		if fwdBucket != nil {
+			err = AckLockedInHtlcs(fwdBucket, diff.LogUpdates)
+			if err != nil {
+				return err
+			}
+		}
+
 		// TODO(roasbeef): use seqno to derive key for later LCP
 
 		// With the bucket retrieved, we'll now serialize the commit
@@ -965,14 +980,15 @@ func (c *OpenChannel) InsertNextRevocation(revKey *btcec.PublicKey) error {
 // rectify the situation. This method will add the current commitment for the
 // remote party to the revocation log, and promote the current pending
 // commitment to the current remove commitment.
-func (c *OpenChannel) AdvanceCommitChainTail() error {
+func (c *OpenChannel) AdvanceCommitChainTail(fwdPackage []LogUpdate) error {
+
 	c.Lock()
 	defer c.Unlock()
 
 	var newRemoteCommit *ChannelCommitment
 
 	err := c.Db.Update(func(tx *bolt.Tx) error {
-		chanBucket, err := readChanBucket(tx, c.IdentityPub,
+		chanBucket, err := updateChanBucket(tx, c.IdentityPub,
 			&c.FundingOutpoint, c.ChainHash)
 		if err != nil {
 			return err
@@ -1024,6 +1040,16 @@ func (c *OpenChannel) AdvanceCommitChainTail() error {
 			return err
 		}
 
+		fwdLogKey := fwdPackageLogBucket
+		fwdBucket, err := chanBucket.CreateBucketIfNotExists(fwdLogKey)
+		if err != nil {
+			return err
+		}
+
+		if err := LockInHtlcs(fwdBucket, fwdPackage); err != nil {
+			return err
+		}
+
 		newRemoteCommit = &newCommit.Commitment
 		return nil
 	})
@@ -1037,6 +1063,40 @@ func (c *OpenChannel) AdvanceCommitChainTail() error {
 	c.RemoteCommitment = *newRemoteCommit
 
 	return nil
+}
+
+// LoadLockedInHtlcs scans the forwarding log for any packages that haven't been
+// processed, and returns their deserialized log updates in map indexed by the
+// remote commitment height at which the updates were locked in.
+func (c *OpenChannel) LoadLockedInHtlcs() ([]LogUpdate, error) {
+	var lockedInHtlcs []LogUpdate
+	if err := c.Db.View(func(tx *bolt.Tx) error {
+
+		chanBucket, err := readChanBucket(tx, c.IdentityPub,
+			&c.FundingOutpoint, c.ChainHash)
+		if err != nil {
+			return err
+		}
+
+		fwdLogKey := fwdPackageLogBucket
+		fwdBucket := chanBucket.Bucket(fwdLogKey)
+		if fwdBucket == nil {
+			return nil
+		}
+
+		htlcs, err := LoadLockedInHtlcs(fwdBucket)
+		if err != nil {
+			return err
+		}
+
+		lockedInHtlcs = htlcs
+
+		return nil
+	}); err != nil {
+		return nil, err
+	}
+
+	return lockedInHtlcs, nil
 }
 
 // RevocationLogTail returns the "tail", or the end of the current revocation
@@ -1688,6 +1748,82 @@ func appendChannelLogEntry(log *bolt.Bucket,
 
 	logEntrykey := makeLogKey(commit.CommitHeight)
 	return log.Put(logEntrykey[:], b.Bytes())
+}
+
+func LockInHtlcs(bkt *bolt.Bucket, htlcs []LogUpdate) error {
+	for i := range htlcs {
+		if err := LockInHtlc(bkt, &htlcs[i]); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func LockInHtlc(bkt *bolt.Bucket, htlc *LogUpdate) error {
+	logKey := makeLogKey(htlc.LogIndex)
+
+	var b bytes.Buffer
+	if err := serializeLogUpdate(&b, htlc); err != nil {
+		return err
+	}
+
+	return bkt.Put(logKey[:], b.Bytes())
+}
+
+func LoadLockedInHtlcs(bkt *bolt.Bucket) ([]LogUpdate, error) {
+	var htlcs []LogUpdate
+	if err := bkt.ForEach(func(k, v []byte) error {
+		if len(k) != 8 {
+			return nil
+		}
+
+		index := binary.BigEndian.Uint64(k)
+
+		htlcReader := bytes.NewReader(v)
+		htlc, err := deserializeLogUpdate(htlcReader)
+		if err != nil {
+			return err
+		}
+
+		htlc.LogIndex = index
+		htlcs = append(htlcs, htlc)
+
+		return nil
+	}); err != nil {
+		return nil, err
+	}
+
+	return htlcs, nil
+}
+
+func AckLockedInHtlcs(bkt *bolt.Bucket, htlcs []LogUpdate) error {
+	for i := range htlcs {
+		err := AckLockedInHtlc(bkt, htlcs[i].LogIndex)
+		if err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func AckLockedInHtlc(bkt *bolt.Bucket, index uint64) error {
+	logKey := makeLogKey(index)
+	return bkt.Delete(logKey[:])
+}
+
+func serializeLogUpdate(w io.Writer, htlc *LogUpdate) error {
+	return writeElement(w, htlc.UpdateMsg)
+}
+
+func deserializeLogUpdate(r io.Reader) (LogUpdate, error) {
+	var htlc LogUpdate
+	if err := readElement(r, &htlc.UpdateMsg); err != nil {
+		return LogUpdate{}, err
+	}
+
+	return htlc, nil
 }
 
 func fetchChannelLogEntry(log *bolt.Bucket,
