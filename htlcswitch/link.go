@@ -442,6 +442,16 @@ func (l *channelLink) htlcManager() {
 		}
 	}
 
+	htlcs, err := l.channel.LoadLockedInHtlcs()
+	if err != nil {
+		l.fail("unable to load previously locked-in htlcs: %v", err)
+		return
+	}
+
+	switchPackets, _ := l.processLockedInHtlcs(htlcs)
+
+	l.cfg.Switch.Forward(switchPackets...)
+
 	// TODO(roasbeef): check to see if able to settle any currently pending
 	// HTLCs
 	//   * also need signals when new invoices are added by the
@@ -709,7 +719,7 @@ func (l *channelLink) handleDownStreamPkt(pkt *htlcPacket, isReProcess bool) {
 
 				// TODO(roasbeef): need to identify if sent
 				// from switch so don't need to obfuscate
-				go l.cfg.Switch.forward(failPkt)
+				l.cfg.Switch.Forward(failPkt)
 				log.Infof("Unable to handle downstream add HTLC: %v", err)
 				return
 			}
@@ -949,23 +959,15 @@ func (l *channelLink) handleUpstreamMsg(msg lnwire.Message) {
 			return
 		}
 
-		// After we treat HTLCs as included in both remote/local
-		// commitment transactions they might be safely propagated over
-		// htlc switch or settled if our node was last node in htlc
-		// path.
-		htlcsToForward := l.processLockedInHtlcs(htlcs)
-		go func() {
-			log.Debugf("ChannelPoint(%v) forwarding %v HTLC's",
-				l.channel.ChannelPoint(), len(htlcsToForward))
-			for _, packet := range htlcsToForward {
-				if err := l.cfg.Switch.forward(packet); err != nil {
-					log.Errorf("channel link(%v): "+
-						"unhandled error while forwarding "+
-						"htlc packet over htlc  "+
-						"switch: %v", l, err)
-				}
+		switchPackets, needUpdate := l.processLockedInHtlcs(htlcs)
+		if needUpdate {
+			if err := l.updateCommitTx(); err != nil {
+				l.fail("unable to update commitment: %v", err)
+				return
 			}
-		}()
+		}
+
+		l.cfg.Switch.Forward(switchPackets...)
 
 	case *lnwire.UpdateFee:
 		// We received fee update from peer. If we are the initiator we
@@ -1155,14 +1157,14 @@ func (l *channelLink) updateChannelFee(feePerKw btcutil.Amount) error {
 // updates is locked-in, then it can be acted upon, meaning: settling HTLCs,
 // cancelling them, or forwarding new HTLCs to the next hop.
 func (l *channelLink) processLockedInHtlcs(
-	paymentDescriptors []*lnwallet.PaymentDescriptor) []*htlcPacket {
+	lockedInHtlcs []*lnwallet.PaymentDescriptor) ([]*htlcPacket, bool) {
 
 	var (
-		needUpdate       bool
-		packetsToForward []*htlcPacket
+		needUpdate    bool
+		switchPackets []*htlcPacket
 	)
 
-	for _, pd := range paymentDescriptors {
+	for _, pd := range lockedInHtlcs {
 		// TODO(roasbeef): rework log entries to a shared
 		// interface.
 		switch pd.EntryType {
@@ -1180,7 +1182,7 @@ func (l *channelLink) processLockedInHtlcs(
 			// Add the packet to the batch to be forwarded, and
 			// notify the overflow queue that a spare spot has been
 			// freed up within the commitment state.
-			packetsToForward = append(packetsToForward, settlePacket)
+			switchPackets = append(switchPackets, settlePacket)
 			l.overflowQueue.SignalFreeSlot()
 
 		// A failureCode message for a previously forwarded HTLC has been
@@ -1200,7 +1202,7 @@ func (l *channelLink) processLockedInHtlcs(
 			// Add the packet to the batch to be forwarded, and
 			// notify the overflow queue that a spare spot has been
 			// freed up within the commitment state.
-			packetsToForward = append(packetsToForward, failPacket)
+			switchPackets = append(switchPackets, failPacket)
 			l.overflowQueue.SignalFreeSlot()
 
 		// An incoming HTLC add has been full-locked in. As a result we
@@ -1225,6 +1227,7 @@ func (l *channelLink) processLockedInHtlcs(
 				// If we're unable to process the onion blob
 				// than we should send the malformed htlc error
 				// to payment sender.
+
 				l.sendMalformedHTLCError(pd.RHash, failureCode,
 					onionBlob[:])
 				needUpdate = true
@@ -1380,7 +1383,7 @@ func (l *channelLink) processLockedInHtlcs(
 				logIndex, _, err := l.channel.SettleHTLC(preimage)
 				if err != nil {
 					l.fail("unable to settle htlc: %v", err)
-					return nil
+					return nil, false
 				}
 
 				// Notify the invoiceRegistry of the invoices
@@ -1389,7 +1392,7 @@ func (l *channelLink) processLockedInHtlcs(
 				err = l.cfg.Registry.SettleInvoice(invoiceHash)
 				if err != nil {
 					l.fail("unable to settle invoice: %v", err)
-					return nil
+					return nil, false
 				}
 
 				// HTLC was successfully settled locally send
@@ -1521,7 +1524,7 @@ func (l *channelLink) processLockedInHtlcs(
 					if err != nil {
 						l.fail("unable to create channel update "+
 							"while handling the error: %v", err)
-						return nil
+						return nil, false
 					}
 
 					failure := lnwire.NewIncorrectCltvExpiry(
@@ -1560,22 +1563,14 @@ func (l *channelLink) processLockedInHtlcs(
 
 				updatePacket := newAddPacket(l.ShortChanID(),
 					fwdInfo.NextHop, addMsg, obfuscator)
-				packetsToForward = append(packetsToForward, updatePacket)
+
+				switchPackets = append(switchPackets,
+					updatePacket)
 			}
 		}
 	}
 
-	if needUpdate {
-		// With all the settle/cancel updates added to the local and
-		// remote HTLC logs, initiate a state transition by updating
-		// the remote commitment chain.
-		if err := l.updateCommitTx(); err != nil {
-			l.fail("unable to update commitment: %v", err)
-			return nil
-		}
-	}
-
-	return packetsToForward
+	return switchPackets, needUpdate
 }
 
 // sendHTLCError functions cancels HTLC and send cancel message back to the
