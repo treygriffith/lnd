@@ -2,6 +2,8 @@ package htlcswitch
 
 import (
 	"crypto/sha256"
+	"encoding/binary"
+	"io"
 
 	"github.com/lightningnetwork/lnd/lnwire"
 )
@@ -99,4 +101,78 @@ func newFailPacket(src lnwire.ShortChannelID, htlc *lnwire.UpdateFailHTLC,
 		amount:       amount,
 		isObfuscated: isObfuscated,
 	}
+}
+
+func (h *htlcPacket) Encode(w io.Writer) error {
+	var scratch [8]byte
+
+	if _, err := w.Write(h.destNode[:]); err != nil {
+		return err
+	}
+
+	if _, err := w.Write(h.payHash[:]); err != nil {
+		return err
+	}
+
+	binary.BigEndian.PutUint64(scratch[:], h.dest.ToUint64())
+	if _, err := w.Write(scratch[:]); err != nil {
+		return err
+	}
+
+	binary.BigEndian.PutUint64(scratch[:], h.src.ToUint64())
+	if _, err := w.Write(scratch[:]); err != nil {
+		return err
+	}
+
+	binary.BigEndian.PutUint64(scratch[:], uint64(h.amount))
+	if _, err := w.Write(scratch[:]); err != nil {
+		return err
+	}
+
+	if _, err := lnwire.WriteMessage(w, h.htlc, 0); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func (h *htlcPacket) Decode(r io.Reader) error {
+	var scratch [8]byte
+
+	if _, err := r.Read(h.destNode[:]); err != nil {
+		return err
+	}
+
+	if _, err := r.Read(h.payHash[:]); err != nil {
+		return err
+	}
+
+	if _, err := r.Read(scratch[:]); err != nil {
+		return err
+	}
+	h.dest = lnwire.NewShortChanIDFromInt(
+		binary.BigEndian.Uint64(scratch[:]),
+	)
+
+	if _, err := r.Read(scratch[:]); err != nil {
+		return err
+	}
+	h.src = lnwire.NewShortChanIDFromInt(
+		binary.BigEndian.Uint64(scratch[:]),
+	)
+
+	if _, err := r.Read(scratch[:]); err != nil {
+		return err
+	}
+	h.amount = lnwire.MilliSatoshi(
+		binary.BigEndian.Uint64(scratch[:]),
+	)
+
+	htlc, err := lnwire.ReadMessage(r, 0)
+	if err != nil {
+		return err
+	}
+	h.htlc = htlc
+
+	return nil
 }
