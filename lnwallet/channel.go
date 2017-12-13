@@ -1208,7 +1208,8 @@ type LightningChannel struct {
 
 	sync.RWMutex
 
-	wg sync.WaitGroup
+	cowg sync.WaitGroup
+	wg   sync.WaitGroup
 
 	shutdown int32
 	quit     chan struct{}
@@ -1342,6 +1343,7 @@ func NewLightningChannel(signer Signer, events chainntnfs.ChainNotifier,
 		// Launch the close observer which will vigilantly watch the
 		// network for any broadcasts the current or prior commitment
 		// transactions, taking action accordingly.
+		lc.cowg.Add(1)
 		go lc.closeObserver(channelCloseNtfn)
 	}
 
@@ -1374,6 +1376,11 @@ func (lc *LightningChannel) CancelObserver() {
 	}
 
 	close(lc.observerQuit)
+}
+
+// WaitForClose blocks until the channel's close observer has terminated.
+func (lc *LightningChannel) WaitForClose() {
+	lc.cowg.Wait()
 }
 
 // ResetState resets the state of the channel back to the default state. This
@@ -1962,6 +1969,8 @@ func newBreachRetribution(chanState *channeldb.OpenChannel, stateNum uint64,
 //
 // NOTE: This MUST be run as a goroutine.
 func (lc *LightningChannel) closeObserver(channelCloseNtfn *chainntnfs.SpendEvent) {
+	defer lc.cowg.Done()
+
 	walletLog.Infof("Close observer for ChannelPoint(%v) active",
 		lc.channelState.FundingOutpoint)
 
