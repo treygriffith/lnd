@@ -194,6 +194,10 @@ func newServer(listenAddrs []string, chanDB *channeldb.DB, cc *chainControl,
 				srvrLog.Errorf("Unable to deliver local close "+
 					"channel request to peer %x, err: %v",
 					pubKey[:], err)
+			case <-s.quit:
+				srvrLog.Errorf("Unable to deliver local close "+
+					"channel request to peer %x, err: %v",
+					pubKey[:], ErrServerShuttingDown)
 			}
 		},
 	})
@@ -343,7 +347,6 @@ func newServer(listenAddrs []string, chanDB *channeldb.DB, cc *chainControl,
 	}
 
 	s.breachArbiter = newBreachArbiter(&BreachConfig{
-		ChainIO:   s.cc.chainIO,
 		CloseLink: closeLink,
 		DB:        chanDB,
 		Estimator: s.cc.feeEstimator,
