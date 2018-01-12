@@ -3,10 +3,10 @@ FROM golang:1.7
 MAINTAINER Olaoluwa Osuntokun <lightning.engineering>
 
 # Expose mainnet ports (server, rpc)
-EXPOSE 8333 8334
+EXPOSE 9333 9334
 
 # Expose testnet ports (server, rpc)
-EXPOSE 18333 18334
+EXPOSE 19333 19334
 
 # Expose simnet ports (server, rpc)
 EXPOSE 18555 18556

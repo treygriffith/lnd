@@ -37,7 +37,7 @@ var bitcoinSimNetParams = realm.Params{
 // network.
 var litecoinSimNetParams = realm.Params{
 	Params:  ltcToBtcParams(&litecoinCfg.SimNetParams),
-	RpcPort: "19556",
+	RpcPort: "18556",
 	Network: realm.SimNet,
 }
 
