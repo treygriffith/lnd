@@ -410,7 +410,7 @@ func loadConfig() (*config, error) {
 
 	// Add default port to all RPC listener addresses if needed and remove
 	// duplicate addresses.
-	cfg.RPCListener = normalizeAddresses([cfg.RPCListener],
+	cfg.RPCListener = normalizeAddress(cfg.RPCListener,
 		strconv.Itoa(defaultRPCPort))
 
 	// Warn about missing config file only after all other configuration is
@@ -617,19 +617,10 @@ func extractRPCParams(btcdConfigPath string) (string, string, error) {
 	return string(userSubmatches[1]), string(passSubmatches[1]), nil
 }
 
-// normalizeAddresses returns a new slice with all the passed addresses
-// normalized with the given default port and all duplicates removed.
-func normalizeAddresses(addrs []string, defaultPort string) []string {
-	result := make([]string, 0, len(addrs))
-	seen := map[string]struct{}{}
-	for _, addr := range addrs {
-		if _, _, err := net.SplitHostPort(addr); err != nil {
-			addr = net.JoinHostPort(addr, defaultPort)
-		}
-		if _, ok := seen[addr]; !ok {
-			result = append(result, addr)
-			seen[addr] = struct{}{}
-		}
+// normalizeAddress normalizes with the given default port
+func normalizeAddress(addr string, defaultPort string) string {
+	if _, _, err := net.SplitHostPort(addr); err != nil {
+		addr = net.JoinHostPort(addr, defaultPort)
 	}
-	return result
+	return addr
 }
