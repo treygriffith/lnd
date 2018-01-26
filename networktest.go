@@ -144,6 +144,7 @@ func newLightningNode(btcrpcConfig *rpcclient.ConnConfig, lndArgs []string) (*li
 	cfg.ReadMacPath = filepath.Join(cfg.DataDir, "readonly.macaroon")
 
 	cfg.PeerPort, cfg.RPCPort = generateListeningPorts()
+	cfg.RPCListen = fmt.Sprintf("localhost:%v", cfg.RPCPort)
 
 	numActiveNodes++
 
@@ -178,7 +179,7 @@ func (l *lightningNode) genArgs() []string {
 	args = append(args, fmt.Sprintf("--bitcoin.rpcuser=%v", l.cfg.Bitcoin.RPCUser))
 	args = append(args, fmt.Sprintf("--bitcoin.rpcpass=%v", l.cfg.Bitcoin.RPCPass))
 	args = append(args, fmt.Sprintf("--bitcoin.rawrpccert=%v", encodedCert))
-	args = append(args, fmt.Sprintf("--rpcport=%v", l.cfg.RPCPort))
+	args = append(args, fmt.Sprintf("--rpclisten=%v", l.cfg.RPCListen))
 	args = append(args, fmt.Sprintf("--peerport=%v", l.cfg.PeerPort))
 	args = append(args, fmt.Sprintf("--logdir=%v", l.cfg.LogDir))
 	args = append(args, fmt.Sprintf("--datadir=%v", l.cfg.DataDir))
