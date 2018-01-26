@@ -176,7 +176,6 @@ func lndMain() error {
 	}
 	sCreds := credentials.NewTLS(tlsConf)
 	serverOpts := []grpc.ServerOption{grpc.Creds(sCreds)}
-	grpcEndpoint := fmt.Sprintf("localhost:%d", loadedConfig.RPCPort)
 	restEndpoint := fmt.Sprintf(":%d", loadedConfig.RESTPort)
 	cCreds, err := credentials.NewClientTLSFromFile(cfg.TLSCertPath,
 		"")
@@ -192,7 +191,7 @@ func lndMain() error {
 	publicWalletPw := []byte("public")
 	if !cfg.NoEncryptWallet {
 		privateWalletPw, publicWalletPw, err = waitForWalletPassword(
-			grpcEndpoint, restEndpoint, serverOpts, proxyOpts,
+			cfg.RPCListener, restEndpoint, serverOpts, proxyOpts,
 			tlsConf, macaroonService,
 		)
 		if err != nil {
@@ -257,7 +256,7 @@ func lndMain() error {
 	lnrpc.RegisterLightningServer(grpcServer, rpcServer)
 
 	// Next, Start the gRPC server listening for HTTP/2 connections.
-	lis, err := net.Listen("tcp", grpcEndpoint)
+	lis, err := net.Listen("tcp", cfg.RPCListener)
 	if err != nil {
 		fmt.Printf("failed to listen: %v", err)
 		return err
@@ -273,7 +272,7 @@ func lndMain() error {
 	defer cancel()
 
 	mux := proxy.NewServeMux()
-	err = lnrpc.RegisterLightningHandlerFromEndpoint(ctx, mux, grpcEndpoint,
+	err = lnrpc.RegisterLightningHandlerFromEndpoint(ctx, mux, cfg.RPCListener,
 		proxyOpts)
 	if err != nil {
 		return err

@@ -106,6 +106,7 @@ type config struct {
 
 	Listeners   []string `long:"listen" description:"Add an interface/port to listen for connections (default all interfaces port: 9735)"`
 	ExternalIPs []string `long:"externalip" description:"Add an ip to the list of local addresses we claim to listen on to peers"`
+	RPCListener  string `long:"rpclisten" description:"Add an interface/port to listen for RPC connections"`
 
 	DebugLevel string `short:"d" long:"debuglevel" description:"Logging level for all subsystems {trace, debug, info, warn, error, critical} -- You may also specify <subsystem>=<level>,<subsystem2>=<level>,... to set the log level for individual subsystems -- Use show to list available subsystems"`
 
@@ -114,7 +115,6 @@ type config struct {
 	Profile string `long:"profile" description:"Enable HTTP profiling on given port -- NOTE port must be between 1024 and 65536"`
 
 	PeerPort           int  `long:"peerport" description:"The port to listen on for incoming p2p connections"`
-	RPCPort            int  `long:"rpcport" description:"The port for the rpc server"`
 	RESTPort           int  `long:"restport" description:"The port for the REST server"`
 	DebugHTLC          bool `long:"debughtlc" description:"Activate the debug htlc mode. With the debug HTLC mode, all payments sent use a pre-determined R-Hash. Additionally, all HTLCs sent to a node with the debug HTLC R-Hash are immediately settled in the next available state transition."`
 	HodlHTLC           bool `long:"hodlhtlc" description:"Activate the hodl HTLC mode.  With hodl HTLC mode, all incoming HTLCs will be accepted by the receiving node, but no attempt will be made to settle the payment with the sender."`
@@ -153,7 +153,6 @@ func loadConfig() (*config, error) {
 		ReadMacPath:         defaultReadMacPath,
 		LogDir:              defaultLogDir,
 		PeerPort:            defaultPeerPort,
-		RPCPort:             defaultRPCPort,
 		RESTPort:            defaultRESTPort,
 		MaxPendingChannels:  defaultMaxPendingChannels,
 		DefaultNumChanConfs: defaultNumChanConfs,
@@ -404,6 +403,16 @@ func loadConfig() (*config, error) {
 		return nil, err
 	}
 
+	// At least one RPCListener is required.
+	if cfg.RPCListener == "" {
+		cfg.RPCListener = fmt.Sprintf("localhost:%d", defaultRPCPort)
+	}
+
+	// Add default port to all RPC listener addresses if needed and remove
+	// duplicate addresses.
+	cfg.RPCListener = normalizeAddresses([cfg.RPCListener],
+		strconv.Itoa(defaultRPCPort))
+
 	// Warn about missing config file only after all other configuration is
 	// done.  This prevents the warning on help messages and invalid
 	// options.  Note this should go directly before the return.
@@ -606,4 +615,21 @@ func extractRPCParams(btcdConfigPath string) (string, string, error) {
 	}
 
 	return string(userSubmatches[1]), string(passSubmatches[1]), nil
+}
+
+// normalizeAddresses returns a new slice with all the passed addresses
+// normalized with the given default port and all duplicates removed.
+func normalizeAddresses(addrs []string, defaultPort string) []string {
+	result := make([]string, 0, len(addrs))
+	seen := map[string]struct{}{}
+	for _, addr := range addrs {
+		if _, _, err := net.SplitHostPort(addr); err != nil {
+			addr = net.JoinHostPort(addr, defaultPort)
+		}
+		if _, ok := seen[addr]; !ok {
+			result = append(result, addr)
+			seen[addr] = struct{}{}
+		}
+	}
+	return result
 }
